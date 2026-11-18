@@ -47,7 +47,7 @@ window.__ModuleLoader__.load({
     const exports = module.exports
 
     const NS = 'dsh-ofm-patch'
-    const inject = []
+    const inject = ['locale']
     const STYLE_ID = 'dsh-ofm-patch-motion'
     const PREFS_KEY = 'dsh-ofm-patch.prefs'
     const FOLDS_KEY = 'dsh-ofm-patch.folds'
@@ -81,6 +81,66 @@ window.__ModuleLoader__.load({
       if (!foldsDirty) return
       foldsDirty = false
       try { localStorage.setItem(FOLDS_KEY, JSON.stringify(folds)) } catch { /* 同上 */ }
+    }
+
+    /* ── i18n（9999.11.6，用户要求「弄的东西英文别忘了」）────────────────── */
+    /* ZH/EN 双字典。apply(ctx) 里注册宿主 browser 侧 locale（同 adapter-compat
+       先例：register 字典 + bind 现取）并替换 t；宿主 locale 缺席时按
+       document.documentElement.lang / navigator.language 探测回落。命令式 DOM
+       （折叠条/更多按钮/浮层）每次构建现取 t()——宿主切语言重渲染冲掉 DOM 后
+       重扫重建自动跟随；控制面板每次打开刷新文案。 */
+    const ZH = {
+      dot: '补',
+      dotTitle: 'ofm-patch：折叠/动画/广告/tab 开关',
+      panelTitle: 'OFM 补丁 · 界面开关',
+      fold: '智能折叠大项',
+      motion: '砍动画（含鱼缸）',
+      ads: '拆广告/推广',
+      tidy: 'tab 收纳（只留勾选项）',
+      collapseNew: '新大项默认收起',
+      keepSub: '保留哪些 tab（勾选 = 显示）：',
+      tabListHint: '打开 OFM 设置页后此处列出全部 tab',
+      more: '更多 ▾',
+      moreTitle: 'ofm-patch tab 管理器：点名称跳转 · ✕ 收起 · 底部可收起全部',
+      popHead: '点名称跳转 · ✕ 收起',
+      hideTitle: '收起该 tab（从保留名单移除，可再从浮层跳回）',
+      hideAria: '收起 {name}',
+      collapseAll: '收起全部（恢复默认保留）',
+      collapseAllTitle: '从保留名单移除 {n} 个跳转过的 tab，恢复默认收纳',
+      foldbarTitle: 'ofm-patch：点击展开/收起这个大项',
+      bigItem: '大项（{h}px）',
+    }
+    const EN = {
+      dot: 'P',
+      dotTitle: 'ofm-patch: fold / motion / ads / tab toggles',
+      panelTitle: 'OFM Patch · UI toggles',
+      fold: 'Smart-fold big blocks',
+      motion: 'Kill animations (incl. fish tank)',
+      ads: 'Hide ads / promos',
+      tidy: 'Tab tidy (keep checked only)',
+      collapseNew: 'Collapse new blocks by default',
+      keepSub: 'Tabs to keep (checked = visible):',
+      tabListHint: 'Open the OFM settings page to list all tabs',
+      more: 'More ▾',
+      moreTitle: 'ofm-patch tab manager: click name to jump · ✕ to collapse · collapse-all at bottom',
+      popHead: 'Click name to jump · ✕ to collapse',
+      hideTitle: 'Collapse this tab (remove from keep list; jump back anytime)',
+      hideAria: 'Collapse {name}',
+      collapseAll: 'Collapse all (restore defaults)',
+      collapseAllTitle: 'Remove {n} jumped-to tabs from the keep list and restore default tidy',
+      foldbarTitle: 'ofm-patch: click to expand/collapse this block',
+      bigItem: 'Big block ({h}px)',
+    }
+    function detectDict() {
+      try {
+        const lang = (document.documentElement.lang || navigator.language || 'zh').toLowerCase()
+        return lang.startsWith('zh') ? ZH : EN
+      } catch { return ZH }
+    }
+    let t = (key, vars) => {
+      let out = detectDict()[key] || ZH[key] || key
+      if (vars) for (const [k, v] of Object.entries(vars)) out = out.split('{' + k + '}').join(String(v))
+      return out
     }
 
     /* ── 工具 ─────────────────────────────────────────────────────────── */
@@ -236,9 +296,9 @@ window.__ModuleLoader__.load({
       bar.dataset.ofmpBar = '1'
       bar.setAttribute('role', 'button')
       bar.setAttribute('aria-expanded', 'false')
-      const title = titleOf(target) || `大项（${Math.round(target.offsetHeight)}px）`
+      const title = titleOf(target) || t('bigItem', { h: Math.round(target.offsetHeight) })
       bar.textContent = `▸ ${title}`
-      bar.title = 'ofm-patch：点击展开/收起这个大项'
+      bar.title = t('foldbarTitle')
       bar.addEventListener('click', event => {
         event.preventDefault()
         event.stopPropagation()
@@ -349,8 +409,8 @@ window.__ModuleLoader__.load({
         }
         /* 清孤儿：目标被 React 卸载而折叠条残留 → 移除。 */
         for (const bar of root.querySelectorAll('[data-ofmp-bar]')) {
-          const t = bar.nextElementSibling
-          if (!t || t.dataset.ofmpTarget !== bar.dataset.ofmpFp) bar.remove()
+          const tgt = bar.nextElementSibling
+          if (!tgt || tgt.dataset.ofmpTarget !== bar.dataset.ofmpFp) bar.remove()
         }
       } catch { /* fail-open */ }
     }
@@ -401,7 +461,8 @@ window.__ModuleLoader__.load({
           more.className = 'ofmp-more'
           more.dataset.ofmpMore = '1'
           more.setAttribute('aria-haspopup', 'menu')
-          more.textContent = '更多 ▾'
+          more.textContent = t('more')
+          more.title = t('moreTitle')
           more.addEventListener('click', event => {
             event.preventDefault()
             event.stopPropagation()
@@ -444,7 +505,7 @@ window.__ModuleLoader__.load({
         morePop.dataset.plugin = NS
         const head = document.createElement('div')
         head.className = 'ofmp-pop-head'
-        head.textContent = '点名称跳转 · ✕ 收起'
+        head.textContent = t('popHead')
         morePop.appendChild(head)
         for (const tab of tabs) {
           const id = tabIdOf(tab)
@@ -471,8 +532,8 @@ window.__ModuleLoader__.load({
             hide.type = 'button'
             hide.dataset.ofmpHide = '1'
             hide.textContent = '✕'
-            hide.title = '收起该 tab（从保留名单移除，可再从浮层跳回）'
-            hide.setAttribute('aria-label', `收起 ${item.textContent}`)
+            hide.title = t('hideTitle')
+            hide.setAttribute('aria-label', t('hideAria', { name: item.textContent }))
             /* 最后一根保留 tab 不可收：全藏 = tab 栏无路可点，ensureVisibleTab
                无处可回，页面失去导航。 */
             if (keep.length <= 1) hide.disabled = true
@@ -496,8 +557,8 @@ window.__ModuleLoader__.load({
           const all = document.createElement('button')
           all.type = 'button'
           all.className = 'ofmp-collapse-all'
-          all.textContent = `收起全部（恢复默认保留）`
-          all.title = `从保留名单移除 ${extra.length} 个跳转过的 tab，恢复默认收纳（免费模型/EAC 模型）`
+          all.textContent = t('collapseAll')
+          all.title = t('collapseAllTitle', { n: extra.length })
           all.addEventListener('click', event => {
             event.stopPropagation()
             prefs.keepTabs = [...defKeep]
@@ -533,15 +594,15 @@ window.__ModuleLoader__.load({
         wrap.id = 'ofmp-panel'
         wrap.dataset.plugin = NS
         wrap.innerHTML = [
-          '<button id="ofmp-dot" type="button" title="ofm-patch：折叠/动画/广告/tab 开关" aria-label="ofm-patch 设置">补</button>',
+          `<button id="ofmp-dot" type="button" title="${t('dotTitle')}" aria-label="ofm-patch">${t('dot')}</button>`,
           '<div id="ofmp-pop" hidden>',
-          '  <div class="ofmp-pop-title">OFM 补丁 · 界面开关</div>',
-          '  <label><input type="checkbox" data-ofmp-pref="fold"> 智能折叠大项</label>',
-          '  <label><input type="checkbox" data-ofmp-pref="motion"> 砍动画（含鱼缸）</label>',
-          '  <label><input type="checkbox" data-ofmp-pref="ads"> 拆广告/推广</label>',
-          '  <label><input type="checkbox" data-ofmp-pref="tidy"> tab 收纳（只留勾选项）</label>',
-          '  <label><input type="checkbox" data-ofmp-pref="collapseNew"> 新大项默认收起</label>',
-          '  <div class="ofmp-pop-sub">保留哪些 tab（勾选 = 显示）：</div>',
+          `  <div class="ofmp-pop-title" data-ofmp-i18n="panelTitle">${t('panelTitle')}</div>`,
+          `  <label><input type="checkbox" data-ofmp-pref="fold"> <span data-ofmp-i18n="fold">${t('fold')}</span></label>`,
+          `  <label><input type="checkbox" data-ofmp-pref="motion"> <span data-ofmp-i18n="motion">${t('motion')}</span></label>`,
+          `  <label><input type="checkbox" data-ofmp-pref="ads"> <span data-ofmp-i18n="ads">${t('ads')}</span></label>`,
+          `  <label><input type="checkbox" data-ofmp-pref="tidy"> <span data-ofmp-i18n="tidy">${t('tidy')}</span></label>`,
+          `  <label><input type="checkbox" data-ofmp-pref="collapseNew"> <span data-ofmp-i18n="collapseNew">${t('collapseNew')}</span></label>`,
+          `  <div class="ofmp-pop-sub" data-ofmp-i18n="keepSub">${t('keepSub')}</div>`,
           '  <div id="ofmp-tablist"></div>',
           '</div>',
         ].join('')
@@ -550,7 +611,7 @@ window.__ModuleLoader__.load({
         dot.addEventListener('click', event => {
           event.stopPropagation()
           pop.hidden = !pop.hidden
-          if (!pop.hidden) renderTabList()
+          if (!pop.hidden) { refreshPanelTexts(); renderTabList() }
         })
         document.addEventListener('click', event => {
           if (!pop.hidden && !pop.contains(event.target)) pop.hidden = true
@@ -587,6 +648,20 @@ window.__ModuleLoader__.load({
         document.body.appendChild(wrap)
       } catch { /* 面板挂不上不影响四件套 */ }
     }
+    /** 面板文案随宿主语言刷新：每次打开面板时重写带 data-ofmp-i18n 标记的
+        文本节点与圆钮（宿主 locale.bind 现取；语言切换无需重建 checkbox）。 */
+    function refreshPanelTexts() {
+      try {
+        const panel = document.getElementById('ofmp-panel')
+        if (!panel) return
+        for (const el of panel.querySelectorAll('[data-ofmp-i18n]')) {
+          const txt = t(el.dataset.ofmpI18n)
+          if (el.textContent !== txt) el.textContent = txt
+        }
+        const dot = panel.querySelector('#ofmp-dot')
+        if (dot) { dot.textContent = t('dot'); dot.title = t('dotTitle') }
+      } catch { /* fail-open */ }
+    }
     /** tab 勾选列表：打开面板时从 DOM 采集（OFM 未渲染则提示）。 */
     function renderTabList() {
       try {
@@ -606,7 +681,7 @@ window.__ModuleLoader__.load({
         if (entries.length === 0) {
           const hint = document.createElement('div')
           hint.className = 'ofmp-hint'
-          hint.textContent = '打开 OFM 设置页后此处列出全部 tab'
+          hint.textContent = t('tabListHint')
           list.appendChild(hint)
           return
         }
@@ -697,7 +772,22 @@ window.__ModuleLoader__.load({
     }
 
     /* ── 入口 ──────────────────────────────────────────────────────────── */
-    function apply() {
+    function apply(ctx) {
+      /* i18n：注册宿主 browser 侧 locale（zh/en 字典 + bind 现取，同
+         adapter-compat 先例）；宿主 locale 缺席时保持探测回落，绝不抛错。 */
+      try {
+        if (ctx && ctx.effect && ctx.locale && typeof ctx.locale.register === 'function') {
+          ctx.effect(() => ctx.locale.register(NS, { zh: ZH, en: EN }), `${NS}: dictionaries`)
+          const bound = typeof ctx.locale.bind === 'function' ? ctx.locale.bind(NS) : null
+          if (bound) {
+            t = (key, vars) => {
+              let out = bound(key) || detectDict()[key] || ZH[key] || key
+              if (vars) for (const [k, v] of Object.entries(vars)) out = out.split('{' + k + '}').join(String(v))
+              return out
+            }
+          }
+        }
+      } catch { /* locale 缺席回落探测语言 */ }
       try {
         buildControlPanel()
         applyMotion() // 兜底 CSS 立即注入（.ofm_root 前缀），首帧即砍动画
