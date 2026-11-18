@@ -1,0 +1,9 @@
+# dsh-ofm-patch bundle patch.
+# 服务端 = 白名单→hiddenModelIds 同步器（零包装，index.js）。
+# 浏览器半身 client.js（9999.11.0）：界面三件套（智能折叠大项/砍过渡动画/拆广告），
+# 锚点=上游 data-ofm-effects 属性与语义特征，fail-open；白名单数据在
+# $DSH_HOME/our-free-model-patch/settings.json。
+- insert:
+    - id: our-free-model-patch
+      name: dsh-ofm-patch
+      config: {}
