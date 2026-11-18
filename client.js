@@ -391,11 +391,10 @@ window.__ModuleLoader__.load({
         const list = root.querySelector('[role="tablist"]')
         if (!list) return
         let more = list.querySelector('[data-ofmp-more]')
-        if (hiddenTabs.length === 0) {
-          if (more) more.remove()
-          closeMorePop()
-          return
-        }
+        /* v3.5：按钮常驻（tidy 开着就显示）。旧版「没有被藏 tab 就删按钮」是
+           死锁：三轮实测里每次「更多」跳转都把该 tab 写进 keepTabs 落盘，13 个
+           全跳完 → 全部保留 → 零隐藏 → 入口自动消失 → 想收起反而找不到任何
+           入口（用户 9999.11.4 重启实测「收起根本找不到」真凶）。 */
         if (!more) {
           more = document.createElement('button')
           more.type = 'button'
