@@ -109,6 +109,10 @@ window.__ModuleLoader__.load({
       collapseAllTitle: '从保留名单移除 {n} 个跳转过的 tab，恢复默认收纳',
       foldbarTitle: 'ofm-patch：点击展开/收起这个大项',
       bigItem: '大项（{h}px）',
+      zenTitle: 'OpenCode 账号车道（ofm-patch 代管）',
+      zenEnable: '启用（opencode_zen 渠道，借 CLI 登录账号）',
+      zenOff: '已关闭',
+      zenBusy: '切换中…',
     }
     const EN = {
       dot: 'P',
@@ -129,6 +133,10 @@ window.__ModuleLoader__.load({
       collapseAll: 'Collapse all (restore defaults)',
       collapseAllTitle: 'Remove {n} jumped-to tabs from the keep list and restore default tidy',
       foldbarTitle: 'ofm-patch: click to expand/collapse this block',
+      zenTitle: 'OpenCode account lane (managed by ofm-patch)',
+      zenEnable: 'Enable (opencode_zen channel, borrows CLI login)',
+      zenOff: 'Off',
+      zenBusy: 'Switching…',
       bigItem: 'Big block ({h}px)',
     }
     function detectDict() {
@@ -604,6 +612,9 @@ window.__ModuleLoader__.load({
           `  <label><input type="checkbox" data-ofmp-pref="collapseNew"> <span data-ofmp-i18n="collapseNew">${t('collapseNew')}</span></label>`,
           `  <div class="ofmp-pop-sub" data-ofmp-i18n="keepSub">${t('keepSub')}</div>`,
           '  <div id="ofmp-tablist"></div>',
+          '  <div class="ofmp-pop-sub" data-ofmp-i18n="zenTitle"></div>',
+          '  <label><input type="checkbox" data-ofmp-zen> <span data-ofmp-i18n="zenEnable"></span></label>',
+          '  <div id="ofmp-zen-status" class="ofmp-hint"></div>',
           '</div>',
         ].join('')
         const dot = wrap.querySelector('#ofmp-dot')
@@ -611,7 +622,7 @@ window.__ModuleLoader__.load({
         dot.addEventListener('click', event => {
           event.stopPropagation()
           pop.hidden = !pop.hidden
-          if (!pop.hidden) { refreshPanelTexts(); renderTabList() }
+          if (!pop.hidden) { refreshPanelTexts(); renderTabList(); renderZenStatus() }
         })
         document.addEventListener('click', event => {
           if (!pop.hidden && !pop.contains(event.target)) pop.hidden = true
@@ -624,6 +635,30 @@ window.__ModuleLoader__.load({
             savePrefs()
             if (!input.checked && key === 'motion') applyMotion() // 关掉即移除 CSS
             scheduleScan('pref-changed')
+          })
+        }
+        /* v4 · zen 账号车道开关：状态存宿主侧 zen-lane.json（非 localStorage），
+           面板打开时拉取实况；切换 POST 给宿主路由，宿主完成 save/remove+discover。 */
+        const zenBox = wrap.querySelector('[data-ofmp-zen]')
+        if (zenBox) {
+          zenBox.addEventListener('change', async () => {
+            const want = zenBox.checked
+            zenBox.disabled = true
+            renderZenStatus(t('zenBusy'))
+            try {
+              const res = await fetch('/api/our-free-model-patch/zen-lane', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ enabled: want }),
+                signal: AbortSignal.timeout(30_000),
+              })
+              const body = await res.json().catch(() => null)
+              renderZenStatus(null, body)
+            } catch (e) {
+              renderZenStatus(String(e?.message ?? e))
+            } finally {
+              zenBox.disabled = false
+            }
           })
         }
         const style = document.createElement('style')
@@ -648,6 +683,35 @@ window.__ModuleLoader__.load({
         document.body.appendChild(wrap)
       } catch { /* 面板挂不上不影响四件套 */ }
     }
+    /** v4 · zen 车道状态行：面板打开/切换后刷新（GET 宿主路由拿实况）。 */
+    function renderZenStatus(busyText, resultBody) {
+      try {
+        const box = document.getElementById('ofmp-zen-status')
+        if (!box) return
+        if (busyText) { box.textContent = busyText; return }
+        fetch('/api/our-free-model-patch/zen-lane', { signal: AbortSignal.timeout(10_000) })
+          .then(r => r.json())
+          .then(body => {
+            const st = body?.state ?? {}
+            const zenBox = document.querySelector('[data-ofmp-zen]')
+            if (zenBox) zenBox.checked = st.enabled === true
+            if (st.enabled !== true) {
+              box.textContent = body?.ok === false && st.lastError ? `${t('zenOff')} · ${st.lastError}` : t('zenOff')
+              return
+            }
+            if (body?.live && body.live.enabled !== true) { box.textContent = `${t('zenBusy')}` ; return }
+            const days = st.tokenExpires ? Math.max(0, Math.round((st.tokenExpires - Date.now()) / 86_400_000)) : null
+            const until = st.tokenExpires ? new Date(st.tokenExpires).toISOString().slice(0, 10) : '?'
+            const parts = [`${st.modelCount ?? '?'} models`]
+            if (days !== null) parts.push(`token→${until} (${days}d)`)
+            if (st.lastSyncAt) parts.push(`sync ${new Date(st.lastSyncAt).toLocaleTimeString()}`)
+            box.textContent = (st.lastError ? `⚠ ${st.lastError}` : '✓') + ' ' + parts.join(' · ')
+          })
+          .catch(e => { box.textContent = String(e?.message ?? e) })
+        if (resultBody?.state) { /* POST 返回已带状态：先呈现，GET 随后校准 */ }
+      } catch { /* fail-open */ }
+    }
+
     /** 面板文案随宿主语言刷新：每次打开面板时重写带 data-ofmp-i18n 标记的
         文本节点与圆钮（宿主 locale.bind 现取；语言切换无需重建 checkbox）。 */
     function refreshPanelTexts() {

@@ -3,6 +3,10 @@
 # 浏览器半身 client.js（9999.11.0）：界面三件套（智能折叠大项/砍过渡动画/拆广告），
 # 锚点=上游 data-ofm-effects 属性与语义特征，fail-open；白名单数据在
 # $DSH_HOME/our-free-model-patch/settings.json。
+# v4（9999.11.7，2026-11-19）：zen 账号车道开关——代管 OFM 聚合渠道 opencode_zen
+# （借 OpenCode CLI 登录账号 OAuth token 打 /inference/openai/v1，绕开匿名公共池）；
+# 右下角面板可见开关，路由 /api/our-free-model-patch/zen-lane（GET 状态/POST 切换，
+# dsh-auth 验签），token 每 30 分钟自动同步 + 开机自愈。状态：zen-lane.json。
 - insert:
     - id: our-free-model-patch
       name: dsh-ofm-patch

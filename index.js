@@ -31,7 +31,7 @@
  * @module index.js
  */
 
-import { readFileSync, appendFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash, createHmac } from 'node:crypto'
 
@@ -230,4 +230,267 @@ export async function apply(ctx, config) {
   }, 'ofm-patch: synchronizer lifecycle')
 
   log('apply: dsh-ofm-patch v2 active (whitelist->hiddenModelIds synchronizer, zero-wrap)')
+
+  /* v4 · zen 账号车道：路由 + token 自愈 + 开机重建（详见下方模块注释） */
+  installZenLaneRoutes(ctx)
+  startZenTokenSync()
+  setTimeout(() => { void healZenLane() }, 8_000).unref?.()
+}
+
+/* ═══ v4 · zen 账号车道开关（2026-11-19 用户拍板「放补丁插件+OFM里加可见开关」）═══
+ * 原理：OFM 2.8.5 的聚合渠道（aggregate）原生支持自定义 provider——借 OpenCode
+ * CLI 登录账号的 OAuth access token（opencode.db credential 表）打现行端点
+ * /inference/openai/v1，绕开写死 Bearer public 的匿名公共池（已被全网烧穿）。
+ * 本插件代管 opencode_zen 渠道的完整生命周期：开=save+discover+白名单合并，
+ * 关=remove；每 30 分钟自检 CLI 侧 token 轮换（CLI 自动续期后自动重写凭据）；
+ * 开机自愈（healZenLane）：状态开着但 OFM 侧渠道被上游更新/重置冲掉时重建。
+ * 上游更新冲不掉本功能：全部逻辑在补丁插件，OFM 侧只落 settings.aggregate 段。 */
+
+const ZEN_PROVIDER = 'opencode_zen'
+const ZEN_BASE_URL = 'https://opencode.ai/inference/openai/v1'
+const ZEN_TOKEN_SYNC_MS = 30 * 60_000
+/* 内置兜底清单（2026-11-19 models.dev opencode provider 的 -free 全集）；
+   开启时先 save 这份，再 discover 上游实盘清单落盘 discovered。 */
+const ZEN_FALLBACK_MODELS = [
+  'tidepool-alpha-free', 'glm-5.3-flash-free', 'muse-spark-1.3-contributor-free',
+  'kimi-k2.5-free', 'ling-2.6-flash-free', 'iceman-free', 'cat-jam-free',
+  'deepseek-v4.1-flash-free', 'glm-4.7-free', 'trinity-large-preview-free',
+  'minimax-m2.5-free', 'fledge-alpha-free', 'minimax-m3-free', 'mimo-v2-omni-free',
+  'exo-free', 'mimo-v2-flash-free', 'hy3-free', 'll-alpha-free',
+  'nemotron-3-super-free', 'north-mini-code-free', 'nemotron-3.5-super-vl-free',
+  'hy3-preview-free', 'nemotron-3.5-lightning-free', 'qwen3.6-plus-free',
+  'ling-3.0-flash-free', 'muse-spark-1.2-contributor-free', 'laguna-s-2.1-free',
+  'mimo-v2.6-flash-free', 'inkling-2-small-free', 'ring-2.6-1t-free',
+  'jev-1.13-free', 'space-bunny-free', 'longcat-2.5-preview-free',
+  'crouton-alpha-free', 'ling-3.0-flash-fin-free', 'flint-40b-free',
+  'hy4-flash-free', 'longcat-2.0-free', 'step-5-preview-free', 'mimo-v2-pro-free',
+  'longcat-2.5-free', 'minimax-m3.1-flash-free', 'ling-3.1-flash-free',
+  'glm-5-free', 'nemotron-3-ultra-free', 'pulse-alpha-free', 'beam-free',
+  'minimax-m2.1-free', 'deepseek-v4-flash-free', 'ling-3.0-tiny-free',
+  'mimo-v2.5-free', 'x-preview-f-free',
+]
+
+const zenStatePath = () => join(dshHomeDir(), 'our-free-model-patch', 'zen-lane.json')
+
+function readZenState() {
+  try {
+    const parsed = JSON.parse(readFileSync(zenStatePath(), 'utf8'))
+    return { enabled: false, lastTokenHash: '', lastSyncAt: 0, lastError: '', modelCount: 0, tokenExpires: 0, email: '', ...parsed }
+  } catch {
+    return { enabled: false, lastTokenHash: '', lastSyncAt: 0, lastError: '', modelCount: 0, tokenExpires: 0, email: '' }
+  }
+}
+
+function writeZenState(state) {
+  try {
+    writeFileSync(zenStatePath(), JSON.stringify(state, null, 2) + '\n')
+  } catch { /* 状态落盘失败不外抛，路由读内存兜底 */ }
+}
+
+/** 读 OpenCode CLI 的 opencode.ai OAuth 凭据（opencode.db credential 表，只读）。 */
+async function readCliCredential() {
+  const candidates = [
+    process.env.XDG_DATA_HOME ? join(process.env.XDG_DATA_HOME, 'opencode', 'opencode.db') : null,
+    join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.local', 'share', 'opencode', 'opencode.db'),
+    join(process.env.LOCALAPPDATA ?? '', 'opencode', 'opencode.db'),
+  ].filter(Boolean)
+  let dbPath = null
+  for (const c of candidates) { try { if (existsSync(c)) { dbPath = c; break } } catch { /* next */ } }
+  if (!dbPath) return { error: 'opencode.db not found (run: opencode auth login)' }
+  let DatabaseSync
+  try { ({ DatabaseSync } = await import('node:sqlite')) } catch (e) { return { error: `node:sqlite unavailable: ${String(e?.message ?? e)}` } }
+  let db
+  try { db = new DatabaseSync(dbPath, { readOnly: true }) } catch (e) { return { error: `db open failed: ${String(e?.message ?? e)}` } }
+  try {
+    const rows = db.prepare("SELECT value FROM credential WHERE integration_id='opencode'").all()
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(row.value)
+        if (parsed?.access && (!parsed.expires || parsed.expires > Date.now())) {
+          return { token: parsed.access, expires: parsed.expires ?? 0, email: parsed.metadata?.email ?? '' }
+        }
+      } catch { /* skip malformed row */ }
+    }
+    return { error: 'no active opencode credential (run: opencode auth login)' }
+  } finally { try { db.close() } catch { /* already closed */ }
+  }
+}
+
+/** 调 OFM 自身 API（自签 dsh-auth cookie，与白名单同步器同一信任域）。 */
+async function ofmApi(method, path, body) {
+  const port = readPatchConfig().port ?? 3080
+  const host = `127.0.0.1:${port}`
+  const res = await fetch(`http://${host}/api/our-free-model${path}`, {
+    method,
+    headers: { 'content-type': 'application/json', cookie: authCookie(host) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(20_000),
+  })
+  const text = await res.text()
+  let json = null
+  try { json = JSON.parse(text) } catch { /* non-JSON body */ }
+  return { ok: res.ok, status: res.status, json, text: text.slice(0, 300) }
+}
+
+/** 开启时把 opencode_zen/<id> 复合 id 合入白名单（防白名单同步器误藏渠道模型）。 */
+function mergeZenWhitelist(upstreamIds) {
+  try {
+    const wlPath = join(dshHomeDir(), 'our-free-model-patch', 'settings.json')
+    let parsed = {}
+    try { parsed = JSON.parse(readFileSync(wlPath, 'utf8')) } catch { /* fresh file */ }
+    const existing = Array.isArray(parsed.visibleModels) ? parsed.visibleModels : []
+    const composite = (upstreamIds.length ? upstreamIds : ZEN_FALLBACK_MODELS).map(id => `${ZEN_PROVIDER}/${id}`)
+    const merged = [...new Set([...existing, ...composite])]
+    if (merged.length === existing.length) return
+    writeFileSync(wlPath, JSON.stringify({ ...parsed, visibleModels: merged }, null, 2) + '\n')
+    log(`zen-lane: whitelist ${existing.length} -> ${merged.length}`)
+  } catch (e) { log(`zen-lane: whitelist merge failed (non-fatal) ${String(e?.message ?? e)}`) }
+}
+
+/** 开关主流程：true=save+discover+白名单；false=remove。全程状态落盘。 */
+async function applyZenLane(enabled) {
+  const state = readZenState()
+  state.enabled = enabled === true
+  state.lastError = ''
+  try {
+    if (!state.enabled) {
+      const rm = await ofmApi('POST', '/providers/remove', { providerId: ZEN_PROVIDER })
+      if (!rm.ok && rm.status !== 404) throw new Error(`remove ${rm.status}: ${rm.text}`)
+      state.lastSyncAt = Date.now()
+      writeZenState(state)
+      log('zen-lane: disabled (opencode_zen removed from aggregate)')
+      return state
+    }
+    const cred = await readCliCredential()
+    if (cred.error) throw new Error(cred.error)
+    const save = await ofmApi('POST', '/providers', {
+      providerId: ZEN_PROVIDER, enabled: true, apiKey: cred.token,
+      baseUrl: ZEN_BASE_URL, models: ZEN_FALLBACK_MODELS,
+    })
+    if (!save.ok) throw new Error(`save ${save.status}: ${save.text}`)
+    let discovered = 0
+    try {
+      const disc = await ofmApi('POST', '/providers/discover', { providerId: ZEN_PROVIDER })
+      if (disc.ok && Array.isArray(disc.json?.models)) {
+        discovered = disc.json.models.length
+        mergeZenWhitelist(disc.json.models)
+      }
+    } catch { /* discover 失败不阻断（save 已带内置清单） */ }
+    state.lastTokenHash = createHash('sha256').update(cred.token).digest('hex').slice(0, 16)
+    state.tokenExpires = cred.expires ?? 0
+    state.email = cred.email ?? ''
+    state.modelCount = discovered || ZEN_FALLBACK_MODELS.length
+    state.lastSyncAt = Date.now()
+    writeZenState(state)
+    log(`zen-lane: enabled (token …${cred.token.slice(-4)}, models ${state.modelCount}, expires ${new Date(state.tokenExpires).toISOString()})`)
+    return state
+  } catch (error) {
+    state.lastError = String(error?.message ?? error)
+    writeZenState(state)
+    log(`zen-lane: FAILED ${state.lastError}`)
+    return state
+  }
+}
+
+/** token 自愈循环：CLI 自动续期后（db 里 token 变化）自动重写渠道凭据。 */
+async function syncZenToken() {
+  const state = readZenState()
+  if (state.enabled !== true) return
+  try {
+    const cred = await readCliCredential()
+    if (cred.error) throw new Error(cred.error)
+    const hash = createHash('sha256').update(cred.token).digest('hex').slice(0, 16)
+    if (hash === state.lastTokenHash) return
+    const save = await ofmApi('POST', '/providers', { providerId: ZEN_PROVIDER, enabled: true, apiKey: cred.token })
+    if (!save.ok) throw new Error(`save ${save.status}: ${save.text}`)
+    state.lastTokenHash = hash
+    state.tokenExpires = cred.expires ?? state.tokenExpires
+    state.email = cred.email ?? state.email
+    state.lastSyncAt = Date.now()
+    state.lastError = ''
+    writeZenState(state)
+    log('zen-lane: token rotated (CLI renewed) → aggregate credential updated')
+  } catch (error) {
+    const cur = readZenState()
+    cur.lastError = `token-sync: ${String(error?.message ?? error)}`
+    writeZenState(cur)
+    log(`zen-lane: token sync FAILED ${cur.lastError}`)
+  }
+}
+
+function startZenTokenSync() {
+  const timer = setInterval(() => { void syncZenToken() }, ZEN_TOKEN_SYNC_MS)
+  timer.unref?.()
+}
+
+/** 开机自愈：状态开着但 OFM 侧渠道丢失（上游更新/设置页重置）→ 重建。 */
+async function healZenLane() {
+  const state = readZenState()
+  if (state.enabled !== true) return
+  try {
+    const r = await ofmApi('GET', `/providers?id=${ZEN_PROVIDER}`)
+    const live = r.json?.configured
+    if (live?.enabled === true && (live.apiKey || live.token)) return
+    log('zen-lane: heal — state on but aggregate lane missing, rebuilding')
+    await applyZenLane(true)
+  } catch (e) { log(`zen-lane: heal check failed (non-fatal) ${String(e?.message ?? e)}`) }
+}
+
+/** 开关操作校验：dsh-auth cookie 验签（与宿主同机信任域，防跨源误触）。 */
+function verifyZenAuth(req) {
+  try {
+    const port = readPatchConfig().port ?? 3080
+    const authority = `127.0.0.1:${port}`
+    const raw = String(req.headers?.cookie ?? '')
+    const name = 'dsh-auth-' + Buffer.from(createHash('sha256').update(authority).digest()).toString('base64url')
+    const pair = raw.split(/;\s*/u).find(c => c.startsWith(`${name}=v1.`))
+    if (!pair) return false
+    const [p64, sig] = pair.slice(name.length + 4).split('.')
+    const secret = Buffer.from(readFileSync(join(dshHomeDir(), '.credentials.yaml'), 'utf8').match(/secret:\s*(\S+)/)[1], 'base64url')
+    if (createHmac('sha256', secret).update(p64).digest('base64url') !== sig) return false
+    const payload = JSON.parse(Buffer.from(p64, 'base64url').toString('utf8'))
+    return payload?.authority === authority && Number(payload?.expiresAt) > Date.now()
+  } catch { return false }
+}
+
+/** 路由：GET 状态 / POST {enabled}。挂在宿主 webServer（同 adapter-compat 模式）。 */
+function installZenLaneRoutes(ctx) {
+  try {
+    const web = ctx?.get?.('webServer') ?? ctx?.webServer
+    if (!web || typeof web.register !== 'function') {
+      log('zen-lane: webServer unavailable (routes dormant until reload)')
+      return
+    }
+    const reply = (res, status, obj) => {
+      try { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-transform' }); res.end(JSON.stringify(obj)) } catch { /* ignore */ }
+    }
+    web.register({
+      kind: 'exact',
+      path: '/api/our-free-model-patch/zen-lane',
+      handler: async (req, res) => {
+        if (req.method === 'GET') {
+          const state = readZenState()
+          let live = null
+          try {
+            const r = await ofmApi('GET', `/providers?id=${ZEN_PROVIDER}`)
+            live = r.json?.configured
+              ? { enabled: r.json.configured.enabled === true, hasKey: Boolean(r.json.configured.apiKey), models: r.json.configured.models?.length ?? 0, discovered: r.json.configured.discovered?.length ?? 0, lastTest: r.json.configured.lastTest ?? null }
+              : null
+          } catch { /* OFM 未起/端口变化：live 留空 */ }
+          return reply(res, 200, { ok: true, state, live })
+        }
+        if (req.method === 'POST') {
+          if (!verifyZenAuth(req)) return reply(res, 401, { ok: false, error: 'bad dsh-auth cookie' })
+          let body = ''
+          try { for await (const chunk of req) { body += chunk; if (body.length > 16384) throw new Error('body too large') } } catch { /* clamp */ }
+          let parsed = {}
+          try { parsed = JSON.parse(body || '{}') } catch { /* empty body */ }
+          const state = await applyZenLane(parsed.enabled === true)
+          return reply(res, 200, { ok: !state.lastError, state })
+        }
+        return reply(res, 405, { ok: false, error: 'method-not-allowed' })
+      },
+    })
+    log('zen-lane: routes registered (/api/our-free-model-patch/zen-lane)')
+  } catch (e) { log(`zen-lane: route install FAILED ${String(e?.message ?? e)}`) }
 }
