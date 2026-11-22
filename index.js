@@ -36,7 +36,7 @@ import { join } from 'node:path'
 import { createHash, createHmac } from 'node:crypto'
 
 export const name = 'our-free-model-patch'
-export const inject = ['llm']
+export const inject = ['llm', 'webServer']
 
 const ROUTES = ['our-free-model', 'our-free-model-region']
 const HIDDEN_CAP = 1000 // 上游 store.js 校验上限，超限整包 400
@@ -231,10 +231,40 @@ export async function apply(ctx, config) {
 
   log('apply: dsh-ofm-patch v2 active (whitelist->hiddenModelIds synchronizer, zero-wrap)')
 
-  /* v4 · zen 账号车道：路由 + token 自愈 + 开机重建（详见下方模块注释） */
+  /* v4 · zen 账号车道：路由保留（用户可见开关），但 healZenLane 已废——
+     2026-11-21 实测它会把 v5 的网关配置（11 模型+环回地址）冲回旧形状
+     （26 模型+opencode.ai/inference）。v5 起配置由 zen-gateway 自维护，
+     heal 只保留「读状态」语义，不再写 settings。 */
   installZenLaneRoutes(ctx)
   startZenTokenSync()
-  setTimeout(() => { void healZenLane() }, 8_000).unref?.()
+  // healZenLane() 不再自动调用（v4 遗物，会覆盖 v5 配置）
+
+  /* v5 · zen 桥接网关（2026-11-22：DSH 插件沙箱阻止 listen，改挂宿主 webServer prefix 路由）。
+     聚合渠道 opencode_zen 的 baseUrl 指到本网关（宿主 webServer 前缀路由），
+     网关把请求翻译成本地 opencode 真 CLI 桥接（用户 Personal 账号额度）。
+     本体零改动；详见 src/zen-gateway.js 头注。 */
+  try {
+    const { pathToFileURL } = await import('node:url')
+    const pluginDir = join(dshHomeDir(), 'plugin-src', 'dsh-ofm-patch')
+    const gwUrl = pathToFileURL(join(pluginDir, 'src', 'zen-gateway.js')).href
+    const bridgeUrl = pathToFileURL(join(pluginDir, 'src', 'opencode-bridge.js')).href
+    const { createZenGatewayHandler } = await import(gwUrl)
+    const { configureBridge } = await import(bridgeUrl)
+    try {
+      const main = JSON.parse(readFileSync(join(dshHomeDir(), 'our-free-model', 'settings.json'), 'utf8'))
+      if (main?.bridge && typeof main.bridge === 'object') configureBridge(main.bridge)
+    } catch { /* 主设置读不到 = 桥接模块默认值（autostart:true, idle 60s） */ }
+    const web = ctx?.get?.('webServer') ?? ctx?.webServer
+    if (!web || typeof web.register !== 'function') {
+      log('zen-gateway: webServer unavailable (gateway dormant until reload)')
+    } else {
+      const handler = createZenGatewayHandler({ log })
+      web.register({ kind: 'prefix', path: '/api/our-free-model-patch/zen-gateway', handler })
+      log('zen-gateway: registered on webServer prefix /api/our-free-model-patch/zen-gateway')
+    }
+  } catch (error) {
+    log(`zen-gateway: bootstrap FAILED (fail-open) ${String(error?.message ?? error)} stack=${String(error?.stack ?? '').slice(0, 400)}`)
+  }
 }
 
 /* ═══ v4 · zen 账号车道开关（2026-11-19 用户拍板「放补丁插件+OFM里加可见开关」）═══
