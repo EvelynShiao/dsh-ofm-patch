@@ -632,7 +632,7 @@ export function assertFreeModel(modelId) {
  *          onUsage?:(tokens:object)=>void}} options
  * @returns {Promise<string>} 全文
  */
-async function bridgeStreamOnce({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart }) {
+async function bridgeStreamOnce({ modelId, prompt, directory, signal, onDelta, onReasoning, onUsage, autostart = bridgeConfig.autostart, sessionId }) {
   const id = assertFreeModel(modelId)
   let svc = await ensureService({ autostart })
   /* 2026-10-31：mute2 定义刚补写/升级（ensurePipeAgent 返回 'updated'）时，运行中的
@@ -656,7 +656,9 @@ async function bridgeStreamOnce({ modelId, prompt, directory, signal, onDelta, o
   const dir = directory ?? process.env.DSH_HOME ?? homedir();
   let session;
   try {
-    session = await createSession(svc, id, dir, signal);
+    session = typeof sessionId === 'string' && sessionId.startsWith('ses_')
+      ? { id: sessionId }
+      : await createSession(svc, id, dir, signal);
   } catch (error) {
     if (signal?.aborted === true) throw error;
     /* 冷启动竞态（2026-10-18）：ensureService 判定服务已就绪，但服务在紧接着建会话
@@ -666,7 +668,9 @@ async function bridgeStreamOnce({ modelId, prompt, directory, signal, onDelta, o
     const retried = await ensureService({ autostart });
     if (retried === null) throw error;
     svc = retried;
-    session = await createSession(svc, id, dir, signal);
+    session = typeof sessionId === 'string' && sessionId.startsWith('ses_')
+      ? { id: sessionId }
+      : await createSession(svc, id, dir, signal);
   }
 
   const ac = new AbortController();
@@ -840,6 +844,30 @@ export async function bridgeStream(options = {}) {
     await new Promise(resolve => setTimeout(resolve, 1500));
     return bridgeStreamOnce(wrapped);
   }
+}
+
+/** Reuse the same battle-tested SSE path with a pre-created local session. */
+export async function bridgeStreamInSession(options = {}) {
+  const sessionId = String(options?.sessionId ?? '')
+  if (!sessionId.startsWith('ses_')) throw new Error('bridgeStreamInSession requires an existing ses_ id')
+  return bridgeStream(options)
+}
+
+/** Read-only request helper for the stateful Zen gateway. No inference is sent. */
+export async function readBridgeJson(path, { method = 'GET', body, signal, timeoutMs = 15000 } = {}) {
+  const svc = await ensureService({ autostart: false })
+  if (svc === null) return { status: 503, data: null }
+  noteBridgeUse()
+  const res = await fetch(`${svc.url}${path}`, {
+    method,
+    headers: headers(svc),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: signal ?? AbortSignal.timeout(timeoutMs),
+  })
+  const text = await res.text()
+  let data = null
+  try { data = text === '' ? null : JSON.parse(text) } catch { data = { raw: text.slice(0, 500) } }
+  return { status: res.status, data }
 }
 
 /**

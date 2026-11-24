@@ -30,9 +30,15 @@
  */
 
 import http from 'node:http'
-import { readFileSync, appendFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { readFileSync, appendFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
-import { bridgeStream } from './opencode-bridge.js'
+import { bridgeStream, createSession, readBridgeJson } from './opencode-bridge.js'
+
+export const ZEN_SESSION_BINDINGS_PATH = join(dshHomeDir(), 'our-free-model-patch', 'zen-session-bindings.json')
+const zenBindings = new Map()
+const zenQueues = new Map()
+let zenBindingsLoaded = false
 
 /* ── 内置兜底模型清单（settings.json 读不到时用；全部 -free） ── */
 const FALLBACK_MODELS = [
@@ -101,9 +107,9 @@ ${catalog}
  * （fork 版吃 DSH 块数组，本版吃 OpenAI wire 形状：content 为 string 或
  * {type:'text'|'image_url'} 数组；assistant 工具调用在 tool_calls 字段。）
  */
-function renderBridgePrompt(messages, tools) {
+function renderBridgePrompt(messages, tools, includeProtocol = true) {
   const parts = []
-  const protocol = bridgeToolPreamble(tools)
+  const protocol = includeProtocol ? bridgeToolPreamble(tools) : ''
   if (protocol !== '') parts.push(`System: ${protocol}`)
   for (const message of Array.isArray(messages) ? messages : []) {
     const role = message?.role ?? 'user'
@@ -208,21 +214,173 @@ function dshHomeDir() {
   return home ? `${String(home).replace(/[\\/]+$/u, '')}/.dsh` : '.dsh'
 }
 
-function laneModels() {
+/* ── 动态模型清单：从本机 opencode 服务 /api/model 拉取（自动识别 -free，带 context/output） ──
+ * 上游切换模型时自动跟随，无需改代码。缓存 5 分钟，失败时回退到上次成功清单或内置兜底。 */
+let _modelCache = { at: 0, models: null, meta: null }
+const MODEL_CACHE_MS = 5 * 60_000
+
+function readOpencodeService() {
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? ''
+  const candidates = [
+    process.env.OPENCODE_SERVER_URL ? { url: process.env.OPENCODE_SERVER_URL, password: process.env.OPENCODE_SERVER_PASSWORD ?? '' } : null,
+    join(home, '.local', 'state', 'opencode', 'service.json'),
+    join(home, '.config', 'opencode', 'service.json'),
+  ].filter(Boolean)
+  for (const p of candidates) {
+    try {
+      if (typeof p === 'object') return p
+      const j = JSON.parse(readFileSync(p, 'utf8'))
+      if (typeof j?.url === 'string' && j.url.length > 0) return { url: j.url.replace(/\/+$/, ''), password: String(j?.password ?? '') }
+      if (typeof j?.password === 'string' && j.password.length > 0) return { url: 'http://127.0.0.1:4096', password: j.password }
+    } catch { /* 换下一个 */ }
+  }
+  return null
+}
+
+async function fetchOpencodeModels() {
+  const svc = readOpencodeService()
+  if (!svc) return null
   try {
-    const parsed = JSON.parse(readFileSync(join(dshHomeDir(), 'our-free-model', 'settings.json'), 'utf8'))
-    const models = parsed?.aggregate?.providers?.opencode_zen?.models
-    if (Array.isArray(models)) {
-      const free = models.filter(id => typeof id === 'string' && FREE_MODEL_RE.test(id))
-      if (free.length > 0) return free
-    }
-  } catch { /* 落兜底 */ }
+    const auth = 'Basic ' + Buffer.from(`opencode:${svc.password}`).toString('base64')
+    const res = await fetch(`${svc.url}/api/model`, {
+      headers: { Authorization: auth, Accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) return null
+    const doc = await res.json()
+    const rows = Array.isArray(doc?.data) ? doc.data : []
+    return rows.filter(m => m && typeof m.id === 'string' && FREE_MODEL_RE.test(m.id) && m.status !== 'disabled')
+  } catch { return null }
+}
+
+function laneModels() {
+  /* 同步返回当前缓存（首次为空时返回内置兜底），异步刷新在后台进行。
+     调用方（/models 端点）每次拿到的是最近一次的实盘清单。 */
+  if (_modelCache.models && Date.now() - _modelCache.at < MODEL_CACHE_MS) return _modelCache.models
+  if (_modelCache.models) return _modelCache.models
   return FALLBACK_MODELS
+}
+
+/** 异步刷新模型清单（/models 端点 await 调用；其他路径可用 laneModels() 读缓存）。 */
+async function refreshLaneModels() {
+  const rows = await fetchOpencodeModels()
+  if (rows && rows.length > 0) {
+    _modelCache = {
+      at: Date.now(),
+      models: rows.map(m => m.id),
+      meta: Object.fromEntries(rows.map(m => [m.id, {
+        name: m.name ?? m.id,
+        context: Number(m?.limit?.context) || null,
+        output: Number(m?.limit?.output) || null,
+        vision: Array.isArray(m?.capabilities?.input) && m.capabilities.input.includes('image'),
+      }])),
+    }
+  }
+  return _modelCache.models ?? FALLBACK_MODELS
+}
+
+/** 模型元数据（context/output/vision），供 OFM 设置页或白名单参考。 */
+function modelMeta(modelId) {
+  return _modelCache.meta?.[modelId] ?? null
 }
 
 function stripProviderPrefix(modelId) {
   const id = String(modelId ?? '').trim()
   return id.startsWith('opencode_zen/') ? id.slice('opencode_zen/'.length) : id
+}
+
+/* ── DSH 会话绑定：首轮全量、后续只发增量；编辑/删除重建本地 ses_ ── */
+
+function messageFingerprint(message) {
+  try { return JSON.stringify(message ?? null) } catch { return String(message) }
+}
+
+function messagesFingerprint(messages) {
+  return createHash('sha256').update(JSON.stringify(messages)).digest('hex')
+}
+
+function loadZenBindings() {
+  if (zenBindingsLoaded) return
+  zenBindingsLoaded = true
+  try {
+    const data = JSON.parse(readFileSync(ZEN_SESSION_BINDINGS_PATH, 'utf8'))
+    for (const [key, row] of Object.entries(data?.sessions ?? {})) {
+      if (row && typeof row.sessionId === 'string' && row.sessionId.startsWith('ses_')) zenBindings.set(key, row)
+    }
+  } catch { /* 首次使用/旧版没有绑定文件 */ }
+}
+
+function saveZenBindings() {
+  const tmp = `${ZEN_SESSION_BINDINGS_PATH}.tmp`
+  mkdirSync(join(ZEN_SESSION_BINDINGS_PATH, '..'), { recursive: true })
+  writeFileSync(tmp, JSON.stringify({ version: 1, sessions: Object.fromEntries(zenBindings) }))
+  renameSync(tmp, ZEN_SESSION_BINDINGS_PATH)
+}
+
+function sessionKey(req, body, modelId) {
+  const dshId = String(req?.headers?.['x-session-id'] ?? req?.headers?.['x-session-affinity'] ?? '').trim()
+  // OFM 原生把 DSH sessionId 放进 x-session-id；缺失时不能伪造跨会话复用。
+  return `${dshId || `anonymous:${messagesFingerprint(body?.messages ?? [])}`}\0${modelId}`
+}
+
+export async function prepareZenTurn(req, body, modelId, log = () => {}, deps = {}) {
+  loadZenBindings()
+  const key = sessionKey(req, body, modelId)
+  const previous = zenQueues.get(key) ?? Promise.resolve()
+  const run = previous.catch(() => {}).then(() => prepareZenTurnUnsafe(key, req, body, modelId, log, deps))
+  zenQueues.set(key, run)
+  try { return await run } finally { if (zenQueues.get(key) === run) zenQueues.delete(key) }
+}
+
+async function prepareZenTurnUnsafe(key, req, body, modelId, log, deps) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  const old = zenBindings.get(key)
+  const usable = old && messages.length >= old.cursor && old.cursor > 0 &&
+    old.fingerprints.every((fp, i) => fp === messageFingerprint(messages[i]))
+  const reuse = Boolean(usable)
+  const delta = reuse ? messages.slice(old.cursor) : messages
+  /* 首轮已把 system/工具目录放进本地会话；续发只送增量，不能把协议再复制一遍。
+     OpenCode 自己保存完整历史，重复注入只会浪费缓存和上下文。 */
+  const prompt = renderBridgePrompt(delta, undefined, false)
+  const basePrompt = renderBridgePrompt(messages, body?.tools)
+  let sessionId = old?.sessionId ?? null
+  let verified = false
+  if (reuse) {
+    const probe = await (deps.probeSession ?? readBridgeJson)(`/api/session/${encodeURIComponent(sessionId)}`)
+    if (probe.status >= 200 && probe.status < 300) verified = true
+  }
+  if (!verified) {
+    if (deps.newSession) sessionId = await deps.newSession(modelId)
+    else {
+      const { ensureService } = await import('./opencode-bridge.js')
+      const svc = await ensureService({ autostart: true })
+      if (svc === null) throw new Error('本机 opencode 服务不可用')
+      sessionId = (await createSession(svc, modelId, dshHomeDir())).id
+    }
+  }
+  const effectiveReuse = reuse && verified
+  const turn = { key, modelId, sessionId, prompt: effectiveReuse ? prompt : basePrompt, reuse: effectiveReuse, messages, basePrompt, oldCursor: old?.cursor ?? 0 }
+  log(`session: key=${key.split('\0')[0]} opencode=${sessionId} mode=${effectiveReuse ? 'incremental' : 'new'} messages=${effectiveReuse ? delta.length : messages.length}/${messages.length} chars=${turn.prompt.length}`)
+  return turn
+}
+
+export function commitZenTurn(turn, body, finalText, outcome, log = () => {}) {
+  if (!outcome?.ok) return
+  const nextMessages = [...turn.messages, { role: 'assistant', content: finalText }]
+  zenBindings.set(turn.key, {
+    sessionId: turn.sessionId,
+    cursor: nextMessages.length,
+    fingerprints: nextMessages.map(messageFingerprint),
+    model: turn.modelId,
+    updatedAt: Date.now(),
+  })
+  saveZenBindings()
+  log(`session: committed opencode=${turn.sessionId} cursor=${nextMessages.length}`)
+}
+
+export function zenSessionDebug() {
+  loadZenBindings()
+  return [...zenBindings.entries()].map(([key, row]) => ({ key: key.split('\0')[0], model: row.model, sessionId: row.sessionId, cursor: row.cursor, updatedAt: row.updatedAt }))
 }
 
 /* ── OpenAI 响应小件 ── */
@@ -251,7 +409,8 @@ async function handleChat(req, res, body, log) {
     if (!res.headersSent) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(payload)) }
     return
   }
-  const prompt = renderBridgePrompt(body?.messages, body?.tools)
+  const turn = await prepareZenTurn(req, body, modelId, log)
+  const prompt = turn.prompt
   const ac = new AbortController()
   /* 2026-11-21 修「首测零内容」：Node 现代版 req 'close' 在请求体读完即触发
      （不是客户端断开），挂它 = 桥接开局即被 abort（实测 ok=false aborted、
@@ -290,6 +449,7 @@ async function handleChat(req, res, body, log) {
     const run = bridgeStream({
       modelId,
       prompt,
+      sessionId: turn.sessionId,
       signal: ac.signal,
       onDelta: delta => {
         if (typeof delta !== 'string' || delta === '') return
@@ -319,8 +479,18 @@ async function handleChat(req, res, body, log) {
   const pieces = outcome.ok ? parseBridgeToolCalls(finalText) : []
   const toolCalls = pieces.filter(p => p.kind === 'tool-call')
   const finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop'
+  commitZenTurn(turn, body, finalText, outcome, log)
+  const inputTokens = Number(usage?.input) || 0
+  const cacheReadTokens = Number(usage?.cache?.read ?? usage?.cache_read ?? usage?.cacheRead ?? usage?.cacheReadInputTokens) || 0
   const usageBlock = usage
-    ? { prompt_tokens: Number(usage.input) || 0, completion_tokens: (Number(usage.output) || 0) + (Number(usage.reasoning) || 0), total_tokens: (Number(usage.input) || 0) + (Number(usage.output) || 0) + (Number(usage.reasoning) || 0) }
+    ? {
+      prompt_tokens: inputTokens + cacheReadTokens,
+      completion_tokens: (Number(usage.output) || 0) + (Number(usage.reasoning) || 0),
+      total_tokens: inputTokens + cacheReadTokens + (Number(usage.output) || 0) + (Number(usage.reasoning) || 0),
+      prompt_tokens_details: { cached_tokens: cacheReadTokens },
+      opencode_session_id: turn.sessionId,
+      dsh_session_mode: turn.reuse ? 'incremental' : 'new',
+    }
     : undefined
 
   if (wantsStream) {
@@ -376,14 +546,30 @@ export function createZenGatewayHandler({ log = () => {} } = {}) {
         const fullUrl = (req.url ?? '').split('?')[0]
         const subPath = fullUrl.replace(/^\/api\/our-free-model-patch\/zen-gateway/, '') || '/'
         if (req.method === 'GET' && (subPath === '/v1/models' || subPath === '/models')) {
-          const data = laneModels().map(id => ({ id, object: 'model', owned_by: 'ofm-patch-bridge' }))
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ object: 'list', data }))
+          /* 动态拉取本机 opencode 实盘清单（自动识别 -free，带 context/output 元数据）。
+             上游切换模型时自动跟随，无需改代码。 */
+          refreshLaneModels().then(models => {
+            const data = models.map(id => {
+              const meta = modelMeta(id)
+              return { id, object: 'model', owned_by: 'ofm-patch-bridge', ...(meta ? { name: meta.name, context_window: meta.context, max_output: meta.output, vision: meta.vision } : {}) }
+            })
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ object: 'list', data }))
+          }).catch(() => {
+            const data = laneModels().map(id => ({ id, object: 'model', owned_by: 'ofm-patch-bridge' }))
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ object: 'list', data }))
+          })
           return
         }
         if (req.method === 'GET' && (subPath === '/' || subPath === '/healthz')) {
           res.writeHead(200, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: true, lane: 'zen-bridge', note: 'OFM patch zen gateway: OpenAI-compat over local opencode bridge' }))
+          return
+        }
+        if (req.method === 'GET' && subPath === '/sessions') {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, sessions: zenSessionDebug() }))
           return
         }
         if (req.method === 'POST' && (subPath === '/v1/chat/completions' || subPath === '/chat/completions')) {
