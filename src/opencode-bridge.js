@@ -465,6 +465,13 @@ export function ensureProbeAgent() {
  * 返回 'ok'（本来就在）/ 'updated'（本次写盘）/ 'failed'（写不进去，回退 build）。
  * 注意：服务只在启动时装载 agent 注册表——'updated' 只代表文件写好了，
  * 运行中的服务仍不认识新形状，createSession 收到 Agent not found 时要重启服务。
+ * （2026-11-24 二进制取证 CLI 2.2.7：compaction.auto=false 时 SessionCompaction.compact
+ *   对 auto/overflow 两类 reason 一律 skipped——溢出补救压缩也被关，只剩手动 /compact；
+ *   runStep 发送前无任何 limit.context 预检，超窗照发上游、上游报错原样透传。
+ *   因此通用无上限策略 = 只关 compaction，**不做逐模型窗口覆盖**（用户铁律
+ *   「不为每个模型维护窗口映射」，且虚假 context 会污染 /api/model 元数据）。
+ *   opencode.json 由服务 watcher 热重载（100ms 防抖），本函数写盘后即时生效，
+ *   服务重启只服务于 agent 注册表变更。）
  * @param {string} [customCfgPath] 可选配置文件路径（测试用）
  */
 export function ensurePipeAgent(customCfgPath) {
@@ -475,39 +482,14 @@ export function ensurePipeAgent(customCfgPath) {
     const agents = (cfg.agent = cfg.agent && typeof cfg.agent === 'object' ? cfg.agent : {})
     const existing = agents[BRIDGE_AGENT]
     const wanted = JSON.stringify(PIPE_AGENT_CONFIG)
-    /* 通用无上限策略：禁用自动压缩，给所有 -free 模型设置极大 context，
-       让本地 CLI 永不主动压缩；上游真实窗口不足时由上游报错透传。 */
+    /* 幂等闸：防 OpenCode 升级悄悄把 compaction 改回自动。 */
     const compaction = cfg.compaction = cfg.compaction && typeof cfg.compaction === 'object' ? cfg.compaction : {}
-    const provider = cfg.provider = cfg.provider && typeof cfg.provider === 'object' ? cfg.provider : {}
-    const opencode = provider.opencode = provider.opencode && typeof provider.opencode === 'object' ? provider.opencode : {}
-    const models = opencode.models = opencode.models && typeof opencode.models === 'object' ? opencode.models : {}
-    const desiredCompaction = compaction.auto === false && compaction.background === false
-    let desiredModels = true
-    // 为所有 -free 后缀模型设置统一大 context（50M，实效无上限）
-    const UNIVERSAL_CONTEXT = 50000000
-    const UNIVERSAL_OUTPUT = 32000
-    for (const [modelId, modelCfg] of Object.entries(models)) {
-      if (!FREE_MODEL_RE.test(modelId)) continue
-      const m = modelCfg && typeof modelCfg === 'object' ? modelCfg : {}
-      const limit = m.limit = m.limit && typeof m.limit === 'object' ? m.limit : {}
-      if (limit.context !== UNIVERSAL_CONTEXT || limit.output !== UNIVERSAL_OUTPUT) {
-        desiredModels = false
-        break
-      }
-    }
     const desired = existing !== undefined && JSON.stringify(existing) === wanted
-      && desiredCompaction && desiredModels
+      && compaction.auto === false && compaction.background === false
     if (desired) return 'ok'
     agents[BRIDGE_AGENT] = PIPE_AGENT_CONFIG
     compaction.auto = false
     compaction.background = false
-    for (const [modelId, modelCfg] of Object.entries(models)) {
-      if (!FREE_MODEL_RE.test(modelId)) continue
-      const m = modelCfg && typeof modelCfg === 'object' ? modelCfg : {}
-      const limit = m.limit = m.limit && typeof m.limit === 'object' ? m.limit : {}
-      limit.context = UNIVERSAL_CONTEXT
-      limit.output = UNIVERSAL_OUTPUT
-    }
     fs.mkdirSync(join(cfgPath, '..'), { recursive: true })
     fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
     return 'updated'
