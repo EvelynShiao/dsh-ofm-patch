@@ -110,7 +110,7 @@ const START_TIMEOUT_MS = 10_000;
  *   - 兼容：仍接受旧的 idleStopMinutes（分钟），收到时×60 折算成秒。
  * ------------------------------------------------------------------ */
 
-let bridgeConfig = { autostart: true, idleStopSeconds: 60 };
+let bridgeConfig = { autostart: true, idleStopSeconds: 0 };
 
 /** 设置页/宿主注入桥接行为；传 {} 只读当前值。即时生效（重排/取消看门狗）。 */
 export function configureBridge(next = {}) {
@@ -465,17 +465,49 @@ export function ensureProbeAgent() {
  * 返回 'ok'（本来就在）/ 'updated'（本次写盘）/ 'failed'（写不进去，回退 build）。
  * 注意：服务只在启动时装载 agent 注册表——'updated' 只代表文件写好了，
  * 运行中的服务仍不认识新形状，createSession 收到 Agent not found 时要重启服务。
+ * @param {string} [customCfgPath] 可选配置文件路径（测试用）
  */
-export function ensurePipeAgent() {
+export function ensurePipeAgent(customCfgPath) {
   try {
-    const cfgPath = join(homedir(), '.config', 'opencode', 'opencode.json')
+    const cfgPath = customCfgPath || join(homedir(), '.config', 'opencode', 'opencode.json')
     let cfg = {}
     try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) } catch { /* 首次创建 */ }
     const agents = (cfg.agent = cfg.agent && typeof cfg.agent === 'object' ? cfg.agent : {})
     const existing = agents[BRIDGE_AGENT]
     const wanted = JSON.stringify(PIPE_AGENT_CONFIG)
-    if (existing !== undefined && JSON.stringify(existing) === wanted) return 'ok'
+    /* 通用无上限策略：禁用自动压缩，给所有 -free 模型设置极大 context，
+       让本地 CLI 永不主动压缩；上游真实窗口不足时由上游报错透传。 */
+    const compaction = cfg.compaction = cfg.compaction && typeof cfg.compaction === 'object' ? cfg.compaction : {}
+    const provider = cfg.provider = cfg.provider && typeof cfg.provider === 'object' ? cfg.provider : {}
+    const opencode = provider.opencode = provider.opencode && typeof provider.opencode === 'object' ? provider.opencode : {}
+    const models = opencode.models = opencode.models && typeof opencode.models === 'object' ? opencode.models : {}
+    const desiredCompaction = compaction.auto === false && compaction.background === false
+    let desiredModels = true
+    // 为所有 -free 后缀模型设置统一大 context（50M，实效无上限）
+    const UNIVERSAL_CONTEXT = 50000000
+    const UNIVERSAL_OUTPUT = 32000
+    for (const [modelId, modelCfg] of Object.entries(models)) {
+      if (!FREE_MODEL_RE.test(modelId)) continue
+      const m = modelCfg && typeof modelCfg === 'object' ? modelCfg : {}
+      const limit = m.limit = m.limit && typeof m.limit === 'object' ? m.limit : {}
+      if (limit.context !== UNIVERSAL_CONTEXT || limit.output !== UNIVERSAL_OUTPUT) {
+        desiredModels = false
+        break
+      }
+    }
+    const desired = existing !== undefined && JSON.stringify(existing) === wanted
+      && desiredCompaction && desiredModels
+    if (desired) return 'ok'
     agents[BRIDGE_AGENT] = PIPE_AGENT_CONFIG
+    compaction.auto = false
+    compaction.background = false
+    for (const [modelId, modelCfg] of Object.entries(models)) {
+      if (!FREE_MODEL_RE.test(modelId)) continue
+      const m = modelCfg && typeof modelCfg === 'object' ? modelCfg : {}
+      const limit = m.limit = m.limit && typeof m.limit === 'object' ? m.limit : {}
+      limit.context = UNIVERSAL_CONTEXT
+      limit.output = UNIVERSAL_OUTPUT
+    }
     fs.mkdirSync(join(cfgPath, '..'), { recursive: true })
     fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
     return 'updated'

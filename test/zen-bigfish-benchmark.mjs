@@ -69,6 +69,7 @@ const sessionId = process.env.ZEN_BENCH_ID || `zen-bigfish-benchmark-${Date.now(
 const requestHeaders = { 'content-type': 'application/json', 'x-session-id': sessionId }
 const results = []
 const marker = '只回复「增量测试收到」，不要回答其他内容。'
+const secondMarker = '刚才我要求你回复的两个测试短句是什么？请逐字依次写出这两句，不要回答其他内容。'
 
 async function send(label, list) {
   const started = Date.now()
@@ -88,9 +89,21 @@ try {
   const added = [...messages, { role: 'assistant', content: firstAnswer }, { role: 'user', content: marker }]
   const secondAnswer = await send('incremental', added)
   const followup = [...added, { role: 'assistant', content: secondAnswer }, { role: 'user', content: '只回复「第二段增量收到」，不要回答其他内容。' }]
-  await send('incremental-again', followup)
+  const thirdAnswer = await send('incremental-again', followup)
+  const recall = [...followup, { role: 'assistant', content: thirdAnswer }, { role: 'user', content: secondMarker }]
+  const recalled = await send('incremental-recall', recall)
+  if (!recalled.includes('增量测试收到') || !recalled.includes('第二段增量收到')) throw new Error(`增量回忆失败：${recalled}`)
   const reduced = added.filter((_, index) => index !== Math.floor(messages.length / 2))
   await send('deleted-middle-full-replay', reduced)
+  const bindings = JSON.parse(fs.readFileSync(path.join(dshHome, 'our-free-model-patch', 'zen-session-bindings.json'), 'utf8'))
+  const binding = bindings.sessions?.[`${sessionId}\0mimo-v2.6-flash-free`]
+  if (!binding?.sessionId) throw new Error('缺少基准绑定，无法核查 compaction')
+  const { readBridgeJson } = await import(pathToFileURL(path.join(dshHome, 'plugin-src', 'dsh-ofm-patch', 'src', 'opencode-bridge.js')).href)
+  const reply = await readBridgeJson(`/api/session/${binding.sessionId}/message`)
+  const rows = reply.data?.data ?? reply.data ?? []
+  const compactions = rows.filter(row => row?.type === 'compaction').map(row => ({ reason: row.reason, status: row.status, error: row.error }))
+  console.log(`COMPACTION_CHECK ${JSON.stringify({ compactions })}`)
+  if (compactions.length > 0) throw new Error('禁压缩配置下仍发生 compaction')
 } finally {
   await new Promise(resolve => server.close(resolve))
 }
