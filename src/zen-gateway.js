@@ -33,7 +33,7 @@ import http from 'node:http'
 import { createHash } from 'node:crypto'
 import { readFileSync, appendFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
-import { bridgeStream, createSession, readBridgeJson } from './opencode-bridge.js'
+import { bridgeStream, createSession, deleteBridgeSession, readBridgeJson } from './opencode-bridge.js'
 
 export const ZEN_SESSION_BINDINGS_PATH = join(dshHomeDir(), 'our-free-model-patch', 'zen-session-bindings.json')
 const zenBindings = new Map()
@@ -291,8 +291,12 @@ function stripProviderPrefix(modelId) {
 
 /* ── DSH 会话绑定：首轮全量、后续只发增量；编辑/删除重建本地 ses_ ── */
 
+/* 2026-11-24 指纹改 sha256 摘要：旧版直接存完整消息 JSON，单条绑定能撑到 ~1.18MB
+   （绑定文件被对话正文灌爆）；「历史没变过」的判定只需要等价比较，64 字符哈希足够。 */
 function messageFingerprint(message) {
-  try { return JSON.stringify(message ?? null) } catch { return String(message) }
+  let raw
+  try { raw = JSON.stringify(message ?? null) } catch { raw = String(message) }
+  return createHash('sha256').update(raw).digest('hex')
 }
 
 function messagesFingerprint(messages) {
@@ -350,6 +354,13 @@ async function prepareZenTurnUnsafe(key, req, body, modelId, log, deps) {
     if (probe.status >= 200 && probe.status < 300) verified = true
   }
   if (!verified) {
+    /* 2026-11-24 同一 DSH id 换新 ses_ 时，旧 opencode 会话就地清掉（用户定案：
+       重建即自清）。OpenCode 侧从不自动回收会话，不清就会永久积压；删除走
+       autostart:false 链路绝不拉起服务，失败也不拦重建（旧会话留着等 zen-cleanup）。 */
+    if (old?.sessionId) {
+      const removed = await (deps.deleteSession ?? deleteBridgeSession)(old.sessionId).catch(error => ({ status: 0, ok: false, error: String(error?.message ?? error) }))
+      log(`session: cleaned superseded opencode=${old.sessionId} status=${removed?.status ?? 'n/a'}`)
+    }
     if (deps.newSession) sessionId = await deps.newSession(modelId)
     else {
       const { ensureService } = await import('./opencode-bridge.js')
@@ -522,6 +533,37 @@ async function handleChat(req, res, body, log) {
   log(`chat: model=${modelId} ok=${outcome.ok}${outcome.ok ? '' : ` err=${String(outcome.error?.message ?? outcome.error).slice(0, 160)}`} bytes=${finalText.length} toolCalls=${toolCalls.length}`)
 }
 
+/* ── 清理：本插件创建的桥接会话（agent 名单过滤；OpenCode 侧无自动清理，这里补位） ──
+ * 2026-11-24 实测 GET /api/session 行形状：{id, projectID, agent, model, cost, tokens,
+ * outcome, time, location}——agent 恒为字符串（"mute2"/"build"），无顶层 directory
+ * （在 location.directory），按 agent 名单过滤即可精确圈定本插件的会话。 */
+export const BRIDGE_AGENT_NAMES = ['mute2', 'mute3', 'pipe3', 'mute', 'pipe']
+export function isBridgeSessionRow(row) {
+  const agent = typeof row?.agent === 'string' ? row.agent : row?.agent?.name
+  if (typeof agent === 'string' && BRIDGE_AGENT_NAMES.includes(agent)) return true
+  return false
+}
+async function cleanupBridgeSessions({ dryRun = false, log = () => {} } = {}) {
+  const listed = await readBridgeJson('/api/session', { timeoutMs: 15000 })
+  if (listed.status !== 200) return { ok: false, reason: `opencode service not reachable (status ${listed.status})` }
+  const rows = (Array.isArray(listed.data) ? listed.data : listed.data?.data) ?? []
+  const targets = rows.filter(isBridgeSessionRow)
+  log(`cleanup: matched ${targets.length}/${rows.length} bridge sessions (dryRun=${dryRun})`)
+  if (dryRun || targets.length === 0) return { ok: true, dryRun, matched: targets.length, total: rows.length, deleted: 0, failed: 0 }
+  let deleted = 0; const failed = []
+  const queue = [...targets]
+  await Promise.all(Array.from({ length: 4 }, async () => {
+    for (;;) {
+      const row = queue.shift()
+      if (!row) return
+      const r = await deleteBridgeSession(row.id).catch(() => ({ ok: false }))
+      if (r?.ok) deleted += 1
+      else { failed.push({ id: row.id, status: r?.status }); if (failed.length > 20) queue.length = 0 }
+    }
+  }))
+  return { ok: failed.length === 0, dryRun, matched: targets.length, total: rows.length, deleted, failed: failed.slice(0, 20) }
+}
+
 /* ── DSH webServer 路由处理器（2026-11-22：DSH 插件沙箱阻止 listen，改挂宿主 webServer） ──
  *
  * 不再 createServer/listen，改为导出 handler 由 index.js 注册到 webServer prefix 路由。
@@ -570,6 +612,33 @@ export function createZenGatewayHandler({ log = () => {} } = {}) {
         if (req.method === 'GET' && subPath === '/sessions') {
           res.writeHead(200, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: true, sessions: zenSessionDebug() }))
+          return
+        }
+        if (req.method === 'GET' && subPath === '/zen-cleanup') {
+          /* GET 只出报告绝不删（防误触）；POST 才真删（{dryRun:true} 可先预演）。 */
+          cleanupBridgeSessions({ dryRun: true, log }).then(result => {
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify(result))
+          }).catch(error => {
+            log(`zen-cleanup GET FAILED ${String(error?.message ?? error)}`)
+            if (!res.headersSent) { try { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify(errorPayload(error))) } catch { /* 已断 */ } }
+          })
+          return
+        }
+        if (req.method === 'POST' && subPath === '/zen-cleanup') {
+          let parsed = {}
+          try { parsed = body === '' ? {} : JSON.parse(body) } catch {
+            res.writeHead(400, { 'content-type': 'application/json' })
+            res.end(JSON.stringify(errorPayload('request body is not valid JSON', 'bad_json')))
+            return
+          }
+          cleanupBridgeSessions({ dryRun: parsed?.dryRun === true, log }).then(result => {
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify(result))
+          }).catch(error => {
+            log(`zen-cleanup POST FAILED ${String(error?.message ?? error)}`)
+            if (!res.headersSent) { try { res.writeHead(502, { 'content-type': 'application/json' }); res.end(JSON.stringify(errorPayload(error))) } catch { /* 已断 */ } }
+          })
           return
         }
         if (req.method === 'POST' && (subPath === '/v1/chat/completions' || subPath === '/chat/completions')) {

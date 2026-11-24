@@ -113,6 +113,13 @@ window.__ModuleLoader__.load({
       zenEnable: '启用（opencode_zen 渠道，借 CLI 登录账号）',
       zenOff: '已关闭',
       zenBusy: '切换中…',
+      cleanupTitle: 'OpenCode 桥接会话清理',
+      cleanupPreview: '可清理 {n} / 共 {total} 个桥接会话（只删 opencode 侧的，DSH 历史不动）',
+      cleanupButton: '清理 {n} 个会话',
+      cleanupConfirm: '确认删除 {n} 个 OpenCode 桥接会话？DSH 侧对话历史不会被删除。',
+      cleanupBusy: '清理中…',
+      cleanupDone: '已删除 {deleted} 个，失败 {failed} 个',
+      cleanupFail: '清理失败',
     }
     const EN = {
       dot: 'P',
@@ -137,6 +144,13 @@ window.__ModuleLoader__.load({
       zenEnable: 'Enable (opencode_zen channel, borrows CLI login)',
       zenOff: 'Off',
       zenBusy: 'Switching…',
+      cleanupTitle: 'OpenCode bridge session cleanup',
+      cleanupPreview: '{n} of {total} bridge sessions cleanable (opencode side only; DSH history untouched)',
+      cleanupButton: 'Clean {n} sessions',
+      cleanupConfirm: 'Delete {n} OpenCode bridge sessions? DSH history is not deleted.',
+      cleanupBusy: 'Cleaning…',
+      cleanupDone: 'Deleted {deleted}, failed {failed}',
+      cleanupFail: 'Cleanup failed',
       bigItem: 'Big block ({h}px)',
     }
     function detectDict() {
@@ -615,6 +629,9 @@ window.__ModuleLoader__.load({
           '  <div class="ofmp-pop-sub" data-ofmp-i18n="zenTitle"></div>',
           '  <label><input type="checkbox" data-ofmp-zen> <span data-ofmp-i18n="zenEnable"></span></label>',
           '  <div id="ofmp-zen-status" class="ofmp-hint"></div>',
+          '  <div class="ofmp-pop-sub" data-ofmp-i18n="cleanupTitle"></div>',
+          '  <div id="ofmp-cleanup-status" class="ofmp-hint"></div>',
+          '  <button id="ofmp-cleanup-btn" type="button" hidden></button>',
           '</div>',
         ].join('')
         const dot = wrap.querySelector('#ofmp-dot')
@@ -622,7 +639,7 @@ window.__ModuleLoader__.load({
         dot.addEventListener('click', event => {
           event.stopPropagation()
           pop.hidden = !pop.hidden
-          if (!pop.hidden) { refreshPanelTexts(); renderTabList(); renderZenStatus() }
+          if (!pop.hidden) { refreshPanelTexts(); renderTabList(); renderZenStatus(); refreshCleanupPreview() }
         })
         document.addEventListener('click', event => {
           if (!pop.hidden && !pop.contains(event.target)) pop.hidden = true
@@ -661,6 +678,32 @@ window.__ModuleLoader__.load({
             }
           })
         }
+        /* v5 · zen-cleanup 清理按钮：GET 先预览 matched/total（绝不删），POST
+           {dryRun:false} 才真删——只删 opencode 侧 ofm-patch 建的 ses_（agent
+           名单过滤），DSH 对话历史原封不动。删除可能逐个排队（批量 4 并发），
+           会话多时要等，超时放宽到 180s。 */
+        const cleanupBtn = wrap.querySelector('#ofmp-cleanup-btn')
+        cleanupBtn.addEventListener('click', async () => {
+          const n = cleanupMatched ?? 0
+          if (n <= 0 || !confirm(t('cleanupConfirm', { n }))) return
+          cleanupBtn.disabled = true
+          renderCleanupStatus(t('cleanupBusy'))
+          try {
+            const res = await fetch('/api/our-free-model-patch/zen-gateway/zen-cleanup', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ dryRun: false }),
+              signal: AbortSignal.timeout(180_000),
+            })
+            const body = await res.json().catch(() => null)
+            if (!body || body.ok !== true) { renderCleanupStatus(`⚠ ${body?.reason ?? t('cleanupFail')}`); return }
+            renderCleanupStatus(t('cleanupDone', { deleted: body.deleted ?? 0, failed: Array.isArray(body.failed) ? body.failed.length : (body.failed ?? 0) }))
+          } catch (e) {
+            renderCleanupStatus(`⚠ ${String(e?.message ?? e)}`)
+          } finally {
+            refreshCleanupPreview({ updateBox: false }) // 保留结果文案，只刷新按钮与计数
+          }
+        })
         const style = document.createElement('style')
         style.dataset.plugin = NS
         style.textContent = [
@@ -678,6 +721,10 @@ window.__ModuleLoader__.load({
           '#ofmp-pop label{display:flex;gap:6px;align-items:center;padding:2px 0;cursor:pointer;user-select:none}',
           '#ofmp-tablist{max-height:180px;overflow:auto}',
           '#ofmp-tablist .ofmp-hint{color:var(--dsw-alias-label-tertiary,#7d90ad);padding:2px 0}',
+          '#ofmp-cleanup-btn{margin-top:4px;padding:4px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgb(120 140 170/45%));',
+          '  background:transparent;color:var(--dsw-alias-label-primary,#dfe9f8);cursor:pointer}',
+          '#ofmp-cleanup-btn:hover:not(:disabled){border-color:var(--dsw-alias-state-danger,rgb(224 112 112));color:var(--dsw-alias-state-danger,rgb(224 112 112))}',
+          '#ofmp-cleanup-btn:disabled{opacity:.4;cursor:not-allowed}',
         ].join('')
         document.head.appendChild(style)
         document.body.appendChild(wrap)
@@ -710,6 +757,36 @@ window.__ModuleLoader__.load({
           .catch(e => { box.textContent = String(e?.message ?? e) })
         if (resultBody?.state) { /* POST 返回已带状态：先呈现，GET 随后校准 */ }
       } catch { /* fail-open */ }
+    }
+
+    /* ── zen-cleanup 清理（2026-11-24）：预览走 GET（dry-run 零副作用），删除走 POST ── */
+    let cleanupMatched = null
+    function renderCleanupStatus(text) {
+      try { const box = document.getElementById('ofmp-cleanup-status'); if (box) box.textContent = text } catch { /* fail-open */ }
+    }
+    /** 预览可清理数：GET 网关 zen-cleanup（服务端 dry-run，绝不删）。
+        updateBox=false 时只刷新按钮与计数（删除完成后保留结果文案用）。 */
+    async function refreshCleanupPreview({ updateBox = true } = {}) {
+      const btn = document.getElementById('ofmp-cleanup-btn')
+      try {
+        const res = await fetch('/api/our-free-model-patch/zen-gateway/zen-cleanup', { signal: AbortSignal.timeout(20_000) })
+        const body = await res.json().catch(() => null)
+        if (!body || body.ok !== true) {
+          if (updateBox) renderCleanupStatus(`⚠ ${body?.reason ?? t('cleanupFail')}`)
+          if (btn) btn.hidden = true
+          return
+        }
+        cleanupMatched = body.matched ?? 0
+        if (btn) {
+          btn.hidden = false
+          btn.textContent = t('cleanupButton', { n: cleanupMatched })
+          btn.disabled = cleanupMatched === 0
+        }
+        if (updateBox) renderCleanupStatus(t('cleanupPreview', { n: cleanupMatched, total: body.total ?? '?' }))
+      } catch (e) {
+        if (updateBox) renderCleanupStatus(`⚠ ${String(e?.message ?? e)}`)
+        if (btn) btn.hidden = true
+      }
     }
 
     /** 面板文案随宿主语言刷新：每次打开面板时重写带 data-ofmp-i18n 标记的

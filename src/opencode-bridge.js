@@ -923,6 +923,15 @@ export async function readBridgeJson(path, { method = 'GET', body, signal, timeo
   return { status: res.status, data }
 }
 
+/** 删除本机 opencode 侧的会话（幂等：404 也算成功）。绝不拉起服务（autostart:false 链路）。 */
+export async function deleteBridgeSession(sessionId, { timeoutMs = 8000 } = {}) {
+  if (typeof sessionId !== 'string' || !sessionId.startsWith('ses_')) return { status: 0, ok: false }
+  try {
+    const res = await readBridgeJson(`/api/session/${encodeURIComponent(sessionId)}`, { method: 'DELETE', timeoutMs })
+    return { status: res.status, ok: res.status >= 200 && res.status < 400 }
+  } catch (error) { return { status: 0, ok: false, error: String(error?.message ?? error) } }
+}
+
 /**
  * 一步到位：建会话 → 生成 → 回收会话。
  * 每次请求一个新会话（本地调用，零成本），避免上下文累积/串味。
