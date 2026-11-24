@@ -838,12 +838,51 @@ export async function bridgeStream(options = {}) {
     return await bridgeStreamOnce(wrapped);
   } catch (error) {
     const msg = String(error?.message ?? error);
+    /* A long-lived OpenCode session can finish after the event socket dies (for
+       example while its automatic compaction interrupts the stream). The POST
+       itself already landed; recover its result instead of replaying a user
+       message or losing a successful answer. */
+    if (options?.signal?.aborted !== true && typeof options?.sessionId === 'string'
+      && /terminated|fetch failed|事件流打不开|socket|ECONNRESET/i.test(msg)) {
+      const recovered = await recoverSessionAfterDisconnect(options.sessionId, options.signal);
+      if (recovered !== null) {
+        for (const block of recovered.content ?? []) {
+          if (block?.type === 'text' && typeof block.text === 'string' && emitted === false) options?.onDelta?.(block.text, block.text);
+          if (block?.type === 'reasoning' && typeof block.text === 'string') options?.onReasoning?.(block.text, block.text);
+        }
+        if (recovered.tokens !== undefined) options?.onUsage?.(recovered.tokens);
+        return (recovered.content ?? []).filter(block => block?.type === 'text').map(block => block.text).join('');
+      }
+    }
     if (emitted || options?.signal?.aborted === true) throw error;
     if (!/fetch failed|事件流打不开/i.test(msg)) throw error;
     if (Date.now() - lastBridgeStartAt > COLD_RETRY_WINDOW_MS) throw error;
     await new Promise(resolve => setTimeout(resolve, 1500));
     return bridgeStreamOnce(wrapped);
   }
+}
+
+/** Read, never regenerate: only a terminal successful assistant message newer
+ * than the supplied prompt is a safe recovery after a broken event stream. */
+async function recoverSessionAfterDisconnect(sessionId, signal) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (signal?.aborted === true) return null;
+    const state = await readBridgeJson(`/api/session/${encodeURIComponent(sessionId)}`, { signal, timeoutMs: 8000 }).catch(() => null);
+    if (state?.status === 200) {
+      const data = state.data?.data ?? state.data;
+      if (data?.outcome === 'succeeded' || data?.time?.idle !== undefined) {
+        const reply = await readBridgeJson(`/api/session/${encodeURIComponent(sessionId)}/message`, { signal, timeoutMs: 10000 }).catch(() => null);
+        const rows = reply?.data?.data ?? reply?.data;
+        if (Array.isArray(rows)) {
+          const message = rows.find(row => row?.type === 'assistant' && row?.time?.completed !== undefined);
+          if (message) return message;
+        }
+        return null;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  return null;
 }
 
 /** Reuse the same battle-tested SSE path with a pre-created local session. */
