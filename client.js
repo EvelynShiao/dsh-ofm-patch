@@ -610,7 +610,11 @@ window.__ModuleLoader__.load({
 
     /* ── 控制面板（fixed 定位，不碰 React 树）──────────────────────────── */
     function buildControlPanel() {
-      if (document.getElementById('ofmp-panel')) return
+      const existing = document.getElementById('ofmp-panel')
+      if (existing) {
+        if (existing.querySelector('#ofmp-cleanup-btn')) return
+        existing.remove()
+      }
       try {
         const wrap = document.createElement('div')
         wrap.id = 'ofmp-panel'
