@@ -591,7 +591,16 @@ window.__ModuleLoader__.load({
           })
           morePop.appendChild(all)
         }
+        const panel = buildControlPanel()
+        if (panel) {
+          if (panel.parentElement) panel.remove()
+          morePop.appendChild(panel)
+        }
         document.body.appendChild(morePop)
+        refreshPanelTexts()
+        renderTabList()
+        renderZenStatus()
+        refreshCleanupPreview()
         const r = anchor.getBoundingClientRect()
         morePop.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - 250))}px`
         morePop.style.top = `${r.bottom + 6}px`
@@ -611,17 +620,13 @@ window.__ModuleLoader__.load({
     /* ── 控制面板（fixed 定位，不碰 React 树）──────────────────────────── */
     function buildControlPanel() {
       const existing = document.getElementById('ofmp-panel')
-      if (existing) {
-        if (existing.querySelector('#ofmp-cleanup-btn')) return
-        existing.remove()
-      }
+      if (existing) return existing
       try {
         const wrap = document.createElement('div')
         wrap.id = 'ofmp-panel'
         wrap.dataset.plugin = NS
         wrap.innerHTML = [
-          `<button id="ofmp-dot" type="button" title="${t('dotTitle')}" aria-label="ofm-patch">${t('dot')}</button>`,
-          '<div id="ofmp-pop" hidden>',
+          '<div id="ofmp-pop">',
           `  <div class="ofmp-pop-title" data-ofmp-i18n="panelTitle">${t('panelTitle')}</div>`,
           `  <label><input type="checkbox" data-ofmp-pref="fold"> <span data-ofmp-i18n="fold">${t('fold')}</span></label>`,
           `  <label><input type="checkbox" data-ofmp-pref="motion"> <span data-ofmp-i18n="motion">${t('motion')}</span></label>`,
@@ -638,16 +643,8 @@ window.__ModuleLoader__.load({
           '  <button id="ofmp-cleanup-btn" type="button" hidden></button>',
           '</div>',
         ].join('')
-        const dot = wrap.querySelector('#ofmp-dot')
         const pop = wrap.querySelector('#ofmp-pop')
-        dot.addEventListener('click', event => {
-          event.stopPropagation()
-          pop.hidden = !pop.hidden
-          if (!pop.hidden) { refreshPanelTexts(); renderTabList(); renderZenStatus(); refreshCleanupPreview() }
-        })
-        document.addEventListener('click', event => {
-          if (!pop.hidden && !pop.contains(event.target)) pop.hidden = true
-        })
+        wrap.addEventListener('click', event => event.stopPropagation())
         for (const input of wrap.querySelectorAll('[data-ofmp-pref]')) {
           const key = input.dataset.ofmpPref
           input.checked = prefs[key] === true
@@ -667,7 +664,7 @@ window.__ModuleLoader__.load({
             zenBox.disabled = true
             renderZenStatus(t('zenBusy'))
             try {
-              const res = await fetch('/api/our-free-model-patch/zen-lane', {
+              const res = await fetch('/api/ofm-patch/zen-lane', {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ enabled: want }),
@@ -693,7 +690,7 @@ window.__ModuleLoader__.load({
           cleanupBtn.disabled = true
           renderCleanupStatus(t('cleanupBusy'))
           try {
-            const res = await fetch('/api/our-free-model-patch/zen-gateway/zen-cleanup', {
+            const res = await fetch('/api/ofm-patch/zen-gateway/zen-cleanup', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ dryRun: false }),
@@ -711,15 +708,9 @@ window.__ModuleLoader__.load({
         const style = document.createElement('style')
         style.dataset.plugin = NS
         style.textContent = [
-          '#ofmp-panel{position:fixed;right:18px;bottom:18px;z-index:99999;font:12px/1.4 system-ui,sans-serif}',
-          '#ofmp-dot{width:30px;height:30px;border-radius:50%;border:1px solid var(--dsw-alias-border-l2,rgb(120 140 170/45%));',
-          '  background:var(--dsw-alias-bg-layer-2,rgb(24 32 48/85%));color:var(--dsw-alias-label-secondary,#9fb3d1);',
-          '  cursor:pointer;opacity:.55;transition:opacity .15s}',
-          '#ofmp-dot:hover{opacity:1}',
-          '#ofmp-pop{position:absolute;right:0;bottom:38px;min-width:200px;max-height:70vh;overflow:auto;padding:10px 12px;border-radius:12px;',
-          '  border:1px solid var(--dsw-alias-border-l2,rgb(120 140 170/45%));',
-          '  background:var(--dsw-alias-bg-layer-2,rgb(20 28 44/96%));color:var(--dsw-alias-label-primary,#dfe9f8);',
-          '  box-shadow:0 8px 24px rgb(0 0 0/30%)}',
+          '#ofmp-panel{font:12px/1.4 system-ui,sans-serif;color:var(--dsw-alias-label-primary,#dfe9f8)}',
+          '#ofmp-pop{min-width:200px;max-width:320px;max-height:42vh;overflow:auto;padding:8px 4px 2px;',
+          '  border-top:1px dashed var(--dsw-alias-border-l2,rgb(120 140 170/40%));margin-top:6px;padding-top:8px}',
           '#ofmp-pop .ofmp-pop-title{font-weight:700;margin-bottom:6px}',
           '#ofmp-pop .ofmp-pop-sub{margin:8px 0 2px;color:var(--dsw-alias-label-secondary,#9fb3d1)}',
           '#ofmp-pop label{display:flex;gap:6px;align-items:center;padding:2px 0;cursor:pointer;user-select:none}',
@@ -731,8 +722,8 @@ window.__ModuleLoader__.load({
           '#ofmp-cleanup-btn:disabled{opacity:.4;cursor:not-allowed}',
         ].join('')
         document.head.appendChild(style)
-        document.body.appendChild(wrap)
       } catch { /* 面板挂不上不影响四件套 */ }
+      return wrap
     }
     /** v4 · zen 车道状态行：面板打开/切换后刷新（GET 宿主路由拿实况）。 */
     function renderZenStatus(busyText, resultBody) {
@@ -740,7 +731,7 @@ window.__ModuleLoader__.load({
         const box = document.getElementById('ofmp-zen-status')
         if (!box) return
         if (busyText) { box.textContent = busyText; return }
-        fetch('/api/our-free-model-patch/zen-lane', { signal: AbortSignal.timeout(10_000) })
+        fetch('/api/ofm-patch/zen-lane', { signal: AbortSignal.timeout(10_000) })
           .then(r => r.json())
           .then(body => {
             const st = body?.state ?? {}
@@ -773,7 +764,7 @@ window.__ModuleLoader__.load({
     async function refreshCleanupPreview({ updateBox = true } = {}) {
       const btn = document.getElementById('ofmp-cleanup-btn')
       try {
-        const res = await fetch('/api/our-free-model-patch/zen-gateway/zen-cleanup', { signal: AbortSignal.timeout(20_000) })
+        const res = await fetch('/api/ofm-patch/zen-gateway/zen-cleanup', { signal: AbortSignal.timeout(20_000) })
         const body = await res.json().catch(() => null)
         if (!body || body.ok !== true) {
           if (updateBox) renderCleanupStatus(`⚠ ${body?.reason ?? t('cleanupFail')}`)
@@ -803,8 +794,7 @@ window.__ModuleLoader__.load({
           const txt = t(el.dataset.ofmpI18n)
           if (el.textContent !== txt) el.textContent = txt
         }
-        const dot = panel.querySelector('#ofmp-dot')
-        if (dot) { dot.textContent = t('dot'); dot.title = t('dotTitle') }
+
       } catch { /* fail-open */ }
     }
     /** tab 勾选列表：打开面板时从 DOM 采集（OFM 未渲染则提示）。 */
@@ -852,9 +842,10 @@ window.__ModuleLoader__.load({
     /* ── 扫描编排 ──────────────────────────────────────────────────────── */
     let scanTimer = null
     let observer = null
+    let attachTimer = null
     function scheduleScan(tag) {
       clearTimeout(scanTimer)
-      scanTimer = setTimeout(() => { scan(tag) }, 80) // 80ms：肉眼基本无感的重放延迟
+      scanTimer = setTimeout(() => { scan(tag) }, 300) // 合并 React/流式 DOM 抖动，避免移动端连续强制回流
     }
     function scan(tag) {
       try {
@@ -883,36 +874,46 @@ window.__ModuleLoader__.load({
       return true
     }
     function startObserver() {
-      /* 热重载防护：模块重载产生新实例时，旧 observer 仍活着（闭包未断），
-         用 window 级标记防双 observer 双扫描（幂等但浪费）。 */
-      if (window.__ofmpObserverAlive) return
-      let lastSync = 0
+      /* 不再监听 document.body：聊天流式渲染与壁纸也会触发全局扫描。只观察
+         OFM 根，且统一进入 300ms 合并队列；回调里不读 offsetHeight，避免每次
+         mutation 都在 paint 前强制回流。 */
+      try { window.__ofmpObserver?.disconnect() } catch { /* old instance already gone */ }
+      try { window.__ofmpDiscovery?.disconnect() } catch { /* old instance already gone */ }
       observer = new MutationObserver(muts => {
-        /* 即时广告隐藏：不等防抖（v3.0 防抖 500ms = 「打开闪现处理前画面」）。 */
-        let sawAd = false
         for (const m of muts) {
           for (const node of m.addedNodes) {
-            if (node.nodeType !== 1) continue
-            if (node.matches?.('[class*="sponsor"],aside') || node.querySelector?.('a[href*="beichenapi"],a[href*="?aff="],a[href*="&aff="]')) {
-              hideAdIn(node)
-              sawAd = true
-            }
+            if (node.nodeType === 1 && node.matches?.('[class*="sponsor"],aside')) hideAdIn(node)
           }
         }
-        const own = muts.every(isOwnMutation)
-        if (own && !sawAd) return
-        /* 同步轻扫（9999.11.3，用户定案「先渲染折叠态才是正确的」）：mutation
-           回调运行在浏览器 paint 之前的微任务阶段，此时挂条/收块=用户看到的
-           首帧就是折叠态，消除「先全展开再跳到折叠」的闪变。30ms 节流防风暴，
-           80ms 防抖完整扫描仍兜底。 */
-        const now = Date.now()
-        if (now - lastSync > 30) {
-          lastSync = now
-          try { scan('sync') } catch { /* 同步轮失败等防抖轮 */ }
-        }
-        scheduleScan('mutation')
+        if (muts.every(isOwnMutation)) return
+        scheduleScan('ofm-mutation')
       })
-      observer.observe(document.body, { childList: true, subtree: true })
+      let discovery = null
+      const attach = () => {
+        const roots = ofmRoots()
+        for (const root of roots) {
+          if (root.dataset.ofmpObserved) continue
+          root.dataset.ofmpObserved = '1'
+          observer.observe(root, { childList: true, subtree: true })
+        }
+        /* OFM 一出现就撤掉全局观察；后续根替换由 1s 低频检查兜底，聊天流式
+           DOM 不再触发任何 discovery 回调。 */
+        if (roots.length > 0 && discovery) {
+          discovery.disconnect()
+          discovery = null
+          window.__ofmpDiscovery = null
+        }
+      }
+      attach()
+      if (ofmRoots().length === 0) {
+        discovery = new MutationObserver(attach)
+        discovery.observe(document.body, { childList: true, subtree: true })
+      }
+      clearInterval(window.__ofmpAttachTimer)
+      attachTimer = setInterval(attach, 1000)
+      window.__ofmpObserver = observer
+      window.__ofmpDiscovery = discovery
+      window.__ofmpAttachTimer = attachTimer
       window.__ofmpObserverAlive = true
     }
 
@@ -934,7 +935,7 @@ window.__ModuleLoader__.load({
         }
       } catch { /* locale 缺席回落探测语言 */ }
       try {
-        buildControlPanel()
+        document.getElementById('ofmp-panel')?.remove() // 旧右下角「补」热重载后立即退场
         applyMotion() // 兜底 CSS 立即注入（.ofm_root 前缀），首帧即砍动画
         startObserver()
         scan('boot') // 立即首扫（OFM 已渲染则当场应用）

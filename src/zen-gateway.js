@@ -567,7 +567,7 @@ async function cleanupBridgeSessions({ dryRun = false, log = () => {} } = {}) {
 /* ── DSH webServer 路由处理器（2026-11-22：DSH 插件沙箱阻止 listen，改挂宿主 webServer） ──
  *
  * 不再 createServer/listen，改为导出 handler 由 index.js 注册到 webServer prefix 路由。
- * OFM 聚合车道 baseUrl = http://127.0.0.1:3080/api/our-free-model-patch/zen-gateway
+ * OFM 聚合车道 baseUrl = http://127.0.0.1:3080/api/ofm-patch/zen-gateway
  * OFM 会 POST 到 {baseUrl}/chat/completions，宿主 webServer 前缀匹配后调本 handler。
  * req.url 是完整路径（含前缀），这里提取子路径做路由。
  */
@@ -582,11 +582,11 @@ export function createZenGatewayHandler({ log = () => {} } = {}) {
     req.on('error', () => { /* 客户端断开，无追责 */ })
     req.on('end', () => {
       try {
-        /* req.url 可能是完整路径（/api/our-free-model-patch/zen-gateway/chat/completions）
+        /* req.url 可能是完整路径（/api/ofm-patch/zen-gateway/chat/completions）
            或子路径（/chat/completions），取决于 DSH webServer 的转发方式。
            统一提取最后一个 / 后的段做路由。 */
         const fullUrl = (req.url ?? '').split('?')[0]
-        const subPath = fullUrl.replace(/^\/api\/our-free-model-patch\/zen-gateway/, '') || '/'
+        const subPath = fullUrl.replace(/^\/api\/ofm-patch\/zen-gateway/, '') || '/'
         if (req.method === 'GET' && (subPath === '/v1/models' || subPath === '/models')) {
           /* 动态拉取本机 opencode 实盘清单（自动识别 -free，带 context/output 元数据）。
              上游切换模型时自动跟随，无需改代码。 */

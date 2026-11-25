@@ -259,8 +259,8 @@ export async function apply(ctx, config) {
       log('zen-gateway: webServer unavailable (gateway dormant until reload)')
     } else {
       const handler = createZenGatewayHandler({ log })
-      web.register({ kind: 'prefix', path: '/api/our-free-model-patch/zen-gateway', handler })
-      log('zen-gateway: registered on webServer prefix /api/our-free-model-patch/zen-gateway')
+      web.register({ kind: 'prefix', path: '/api/ofm-patch/zen-gateway', handler })
+      log('zen-gateway: registered on webServer prefix /api/ofm-patch/zen-gateway')
     }
   } catch (error) {
     log(`zen-gateway: bootstrap FAILED (fail-open) ${String(error?.message ?? error)} stack=${String(error?.stack ?? '').slice(0, 400)}`)
@@ -496,7 +496,7 @@ function installZenLaneRoutes(ctx) {
     }
     web.register({
       kind: 'exact',
-      path: '/api/our-free-model-patch/zen-lane',
+      path: '/api/ofm-patch/zen-lane',
       handler: async (req, res) => {
         if (req.method === 'GET') {
           const state = readZenState()
@@ -521,6 +521,6 @@ function installZenLaneRoutes(ctx) {
         return reply(res, 405, { ok: false, error: 'method-not-allowed' })
       },
     })
-    log('zen-lane: routes registered (/api/our-free-model-patch/zen-lane)')
+    log('zen-lane: routes registered (/api/ofm-patch/zen-lane)')
   } catch (e) { log(`zen-lane: route install FAILED ${String(e?.message ?? e)}`) }
 }
