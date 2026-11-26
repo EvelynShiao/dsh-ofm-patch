@@ -25,7 +25,7 @@
     "synchronizer"
   ],
   "author": "EvelynShiao",
-  "license": "MIT",
+  "license": "MPL-2.0",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
