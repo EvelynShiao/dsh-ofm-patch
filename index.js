@@ -212,6 +212,7 @@ export async function apply(ctx, config) {
   // 3) 白名单文件热改 → 立即重算（防抖）
   let debounce = null
   let watcher = null
+  let shimDispose = null
   try {
     const fs = await import('node:fs')
     const whitelistPath = join(dshHomeDir(), 'our-free-model-patch', 'settings.json')
@@ -259,11 +260,31 @@ export async function apply(ctx, config) {
       log('zen-gateway: webServer unavailable (gateway dormant until reload)')
     } else {
       const handler = createZenGatewayHandler({ log })
-      web.register({ kind: 'prefix', path: '/api/ofm-patch/zen-gateway', handler })
+      /* web.register 返回 disposer：热重载（插件停用/启用）时必须注销，
+         否则下一次 apply 撞 duplicate prefix route，网关被静默留在旧实例上。 */
+      const disposeRoute = web.register({ kind: 'prefix', path: '/api/ofm-patch/zen-gateway', handler })
+      if (typeof disposeRoute === 'function') {
+        ctx.effect?.(() => () => { try { disposeRoute() } catch { /* 已注销 */ } }, 'ofm-patch: zen-gateway route')
+      }
       log('zen-gateway: registered on webServer prefix /api/ofm-patch/zen-gateway')
     }
   } catch (error) {
     log(`zen-gateway: bootstrap FAILED (fail-open) ${String(error?.message ?? error)} stack=${String(error?.stack ?? '').slice(0, 400)}`)
+  }
+
+  /* v6 · 环回鉴权垫片（2026-11-26）：宿主 webServer 的 cookie 闸门会把 OFM 从
+     进程内部发往本网关的请求挡成 401。包一层 globalThis.fetch，只对
+     「回环地址 + /api/ofm-patch/zen-gateway」补 dsh-auth cookie；OFM 本体零改动
+     （用户明令：不要改 OFM）。任何异常 fail-open。 */
+  try {
+    const { pathToFileURL } = await import('node:url')
+    const shimUrl = pathToFileURL(join(dshHomeDir(), 'plugin-src', 'dsh-ofm-patch', 'src', 'loopback-auth.js')).href
+    const { installLoopbackAuth } = await import(shimUrl)
+    const dispose = installLoopbackAuth({ log })
+    shimDispose = dispose
+    ctx.effect?.(() => () => { try { dispose() } catch { /* 已卸载 */ } }, 'ofm-patch: loopback auth shim')
+  } catch (error) {
+    log(`loopback-auth: bootstrap FAILED (fail-open) ${String(error?.message ?? error)}`)
   }
 }
 
