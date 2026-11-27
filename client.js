@@ -874,9 +874,9 @@ window.__ModuleLoader__.load({
       return true
     }
     function startObserver() {
-      /* 不再监听 document.body：聊天流式渲染与壁纸也会触发全局扫描。只观察
-         OFM 根，且统一进入 300ms 合并队列；回调里不读 offsetHeight，避免每次
-         mutation 都在 paint 前强制回流。 */
+      /* 首屏铁律：发现 OFM 的同一个 MutationObserver 微任务里同步应用补丁，
+         不能等 300ms 扫描、1s attach 或用户再点一下。全局 observer 只做「OFM
+         是否出现/被替换」的轻量判定；聊天流式 mutation 不读布局、不全扫。 */
       try { window.__ofmpObserver?.disconnect() } catch { /* old instance already gone */ }
       try { window.__ofmpDiscovery?.disconnect() } catch { /* old instance already gone */ }
       observer = new MutationObserver(muts => {
@@ -886,35 +886,52 @@ window.__ModuleLoader__.load({
           }
         }
         if (muts.every(isOwnMutation)) return
-        scheduleScan('ofm-mutation')
+        /* 设置页的 React 更新可能先挂原版 page、后补 data-ofm-effects；这里
+           同步 scan，下一轮 mutation 再做幂等重放，不能让旧画面先 paint。 */
+        scan('ofm-mutation-first-paint')
       })
       let discovery = null
       const attach = () => {
         const roots = ofmRoots()
+        let attachedNew = false
         for (const root of roots) {
           if (root.dataset.ofmpObserved) continue
           root.dataset.ofmpObserved = '1'
           observer.observe(root, { childList: true, subtree: true })
+          attachedNew = true
         }
-        /* OFM 一出现就撤掉全局观察；后续根替换由 1s 低频检查兜底，聊天流式
-           DOM 不再触发任何 discovery 回调。 */
-        if (roots.length > 0 && discovery) {
-          discovery.disconnect()
-          discovery = null
-          window.__ofmpDiscovery = null
-        }
+        if (attachedNew) scan('ofm-discovered-first-paint')
       }
       attach()
-      if (ofmRoots().length === 0) {
-        discovery = new MutationObserver(attach)
-        discovery.observe(document.body, { childList: true, subtree: true })
-      }
+      /* 永久保留轻量全局 discovery：关闭 OFM 后根会卸载，下次进入必须重新
+         捕获；旧版发现一次就 disconnect，导致再次进入只能等用户操作。 */
+      discovery = new MutationObserver(() => {
+        if (ofmRoots().length > 0) attach()
+      })
+      discovery.observe(document.body, { childList: true, subtree: true })
       clearInterval(window.__ofmpAttachTimer)
       attachTimer = setInterval(attach, 1000)
       window.__ofmpObserver = observer
       window.__ofmpDiscovery = discovery
       window.__ofmpAttachTimer = attachTimer
       window.__ofmpObserverAlive = true
+      /* 首次点击「Our Free Model」后，history/弹窗宿主可能不新增任何 OFM
+         子节点；导航事件是独立于 DOM 的第二条首屏触发通道。 */
+      if (!window.__ofmpNavigationHooked) {
+        window.__ofmpNavigationHooked = true
+        const kick = () => scan('navigation-first-paint')
+        window.addEventListener('popstate', kick)
+        window.addEventListener('hashchange', kick)
+        for (const method of ['pushState', 'replaceState']) {
+          const original = history[method]
+          if (typeof original !== 'function') continue
+          history[method] = function (...args) {
+            const result = original.apply(this, args)
+            kick()
+            return result
+          }
+        }
+      }
     }
 
     /* ── 入口 ──────────────────────────────────────────────────────────── */
